@@ -21,6 +21,7 @@ model StaffUser {
   createdBy    StaffUser?  @relation("StaffCreatedBy", fields: [createdById], references: [id])
   createdStaff StaffUser[] @relation("StaffCreatedBy")
   boardVotes   BoardApprovalVote[]
+  confirmedMembershipPayments MembershipApplication[] @relation("MembershipPaymentConfirmedBy")
 }
 
 enum StaffRole {
@@ -64,9 +65,14 @@ model Participant {
   /** Denormalized from full profile for search/list (present address formatted) */
   mailingAddress      String?   @db.Text
   civilStatus           String?
-  /** Normalized digits (typically 9). Legacy roster reclaim; do not confuse with `memberIdNo` (B2C public ID). */
-  tinNo                 String?
-  memberIdNo            String?
+  /** Normalized digits (typically 9). Unique when set; blanks are stored as NULL. */
+  tinNo                 String?   @unique
+  /** B2C public login ID (`B2C-II-YY-XXXX`). Unique when set. */
+  memberIdNo            String?   @unique
+  /** Set when an online application is submitted without TIN; cleared when TIN is saved. */
+  tinMissingFlaggedAt   DateTime?
+  /** "online_form" | "self_signup" | "legacy_import" */
+  registrationSource    String?
   /**
    * Optional member-chosen handle (lowercase). Unique when set; authenticated changes via PATCH /pmes/member/callsign.
    * Alternate public label when set; otherwise see lastNameKey + lastNameSeq (e.g. cruz-2).
@@ -97,8 +103,87 @@ model Participant {
   pmesRecords   PmesRecord[]
   loiSubmission LoiSubmission?
   storeOrders   StoreOrder[]
+  membershipApplication MembershipApplication?
 
   @@index([referredByParticipantId])
+}
+
+enum MembershipApplicationStatus {
+  DRAFT
+  SUBMITTED
+  PAYMENT_CONFIRMED
+  BOD_APPROVED
+  APPROVED
+  REJECTED
+  WITHDRAWN
+  EXPIRED
+}
+
+enum PaymentMode {
+  CASH
+  GCASH
+}
+
+/** Public online membership registration (FEAT-004). Drafts expire after 60 days. */
+model MembershipApplication {
+  id                      String                       @id @default(uuid())
+  status                  MembershipApplicationStatus  @default(DRAFT)
+  resumeTokenHash         String                       @unique
+  resumeTokenExpiresAt    DateTime?
+  pendingResumeTokenHash  String?                      @unique
+  pendingResumeTokenExpiresAt DateTime?
+  participantId           String?                      @unique
+  participant             Participant?                 @relation(fields: [participantId], references: [id], onDelete: SetNull)
+  fullName                String?
+  firstName               String?
+  middleName              String?
+  lastName                String?
+  dob                     DateTime?                    @db.Date
+  gender                  String?
+  email                   String
+  mobile                  String?
+  tinNo                   String?
+  residentialAddress      Json?
+  referredByParticipantId String?
+  shareCapitalAmount      Decimal                      @default(1000) @db.Decimal(14, 2)
+  shareCapitalPaid        Boolean                      @default(false)
+  membershipFeeAmount     Decimal                      @default(500) @db.Decimal(14, 2)
+  membershipFeePaid       Boolean                      @default(false)
+  paymentMode             PaymentMode?
+  gcashRefNo              String?
+  gcashScreenshotKey      String?
+  paymentDeclaredAt       DateTime?
+  treasurerNotifiedAt     DateTime?
+  dpaConsentAt            DateTime?
+  dpaConsentVersion       String?
+  consentIp               String?
+  userAgent               String?
+  possibleDuplicateOfId   String?
+  submittedAt             DateTime?
+  paymentConfirmedAt      DateTime?
+  paymentConfirmedById    String?
+  paymentConfirmedBy      StaffUser?                   @relation("MembershipPaymentConfirmedBy", fields: [paymentConfirmedById], references: [id], onDelete: SetNull)
+  receiptNo               String?
+  rejectedAt              DateTime?
+  rejectionReason         String?
+  createdAt               DateTime                     @default(now())
+  updatedAt               DateTime                     @updatedAt
+
+  @@index([status])
+  @@index([email])
+  @@index([mobile])
+  @@index([tinNo])
+}
+
+/** Sliding-window counters for public membership endpoints (per IP / email). */
+model MembershipRateLimit {
+  id          String   @id @default(uuid())
+  bucketKey   String
+  windowStart DateTime
+  count       Int      @default(0)
+
+  @@unique([bucketKey, windowStart])
+  @@index([bucketKey])
 }
 
 /** Member / webhook store checkout — posts to accounting via `externalId` (idempotent). */

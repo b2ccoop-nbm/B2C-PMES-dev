@@ -377,7 +377,7 @@ export const PmesService = {
    * Persist portal “Member profile” fields (name, mobile, DOB, gender, residence as mailing) to the participant row.
    * Requires Firebase Bearer for the same email.
    */
-  async patchMemberBasicProfile({ email, fullName, phone, dob, gender, mailingAddress, idToken }) {
+  async patchMemberBasicProfile({ email, fullName, phone, dob, gender, mailingAddress, tinNo, idToken }) {
     if (!useRest()) throw new Error("API required");
     const body = { email: String(email || "").trim() };
     if (fullName !== undefined) body.fullName = fullName;
@@ -385,6 +385,7 @@ export const PmesService = {
     if (dob !== undefined) body.dob = dob;
     if (gender !== undefined) body.gender = gender;
     if (mailingAddress !== undefined) body.mailingAddress = mailingAddress;
+    if (tinNo !== undefined) body.tinNo = tinNo;
     const response = await fetch(`${apiBase()}/pmes/member/basic-profile`, {
       method: "PATCH",
       headers: {
@@ -461,7 +462,7 @@ export const PmesService = {
     return response.json();
   },
 
-  async recordSecretaryBoardConfirm(accessToken, participantId) {
+  async recordSecretaryBoardConfirm(accessToken, participantId, { forcePmesOverride } = {}) {
     if (!useRest()) throw new Error("API required");
     const response = await fetch(`${apiBase()}/pmes/admin/participant/secretary-confirm`, {
       method: "POST",
@@ -469,7 +470,7 @@ export const PmesService = {
         "Content-Type": "application/json",
         Authorization: `Bearer ${accessToken}`,
       },
-      body: JSON.stringify({ participantId }),
+      body: JSON.stringify({ participantId, forcePmesOverride: forcePmesOverride === true }),
     });
     if (!response.ok) {
       throw new Error(await parseApiErrorMessage(response));

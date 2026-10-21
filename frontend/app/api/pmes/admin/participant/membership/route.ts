@@ -5,6 +5,8 @@ import { EDGE_CORS_HEADERS, edgeCorsOptions } from "@/lib/edge-cors";
 import { requireStaff, unauthorized, forbidden } from "@/lib/staff-edge-auth";
 import { toLifecyclePayload } from "@/lib/pmes-edge/admin-lifecycle";
 import { selectAdminLifecycleRowByParticipantId } from "@/lib/pmes-edge/admin-participant-queries";
+import { assertPmesPassedForSecretary, forcePmesOverrideAudit } from "@/lib/membership/pmes-gate";
+import { syncApplicationFromParticipant } from "@/lib/membership/edge-service";
 
 export function OPTIONS() {
   return edgeCorsOptions();
@@ -14,7 +16,7 @@ export async function PATCH(request: Request) {
   try {
     const staff = await requireStaff(request);
     const body = (await request.json().catch(() => null)) as
-      | { participantId?: string; initialFeesPaid?: boolean; boardApproved?: boolean }
+      | { participantId?: string; initialFeesPaid?: boolean; boardApproved?: boolean; forcePmesOverride?: boolean }
       | null;
     const participantId = String(body?.participantId ?? "").trim();
     const initialFeesPaid = body?.initialFeesPaid === true;
@@ -40,6 +42,29 @@ export async function PATCH(request: Request) {
         "Use Secretary confirmation to record Board approval with a resolution number. Superuser may override here for legacy support.",
         EDGE_CORS_HEADERS,
       );
+    }
+    if (boardApproved) {
+      const pmesRows = await getSql()`
+        SELECT id FROM "PmesRecord" WHERE "participantId" = ${participantId} AND passed = true LIMIT 1
+      `;
+      const pmesPassed = (pmesRows as { id: string }[]).length > 0;
+      const force = body?.forcePmesOverride === true;
+      const gate = assertPmesPassedForSecretary(pmesPassed, {
+        force,
+        actorRole: staff.role,
+      });
+      if (!gate.ok) {
+        return NextResponse.json({ message: gate.message, statusCode: 400 }, { status: 400, headers: EDGE_CORS_HEADERS });
+      }
+      const audit = forcePmesOverrideAudit({
+        participantId,
+        actorRole: staff.role,
+        force,
+        pmesPassed,
+      });
+      if (audit.shouldLog) {
+        console.warn(audit.message);
+      }
     }
 
     const sql = getSql();
@@ -83,6 +108,7 @@ export async function PATCH(request: Request) {
       return NextResponse.json({ message: "Participant not found", statusCode: 404 }, { status: 404, headers: EDGE_CORS_HEADERS });
     }
 
+    await syncApplicationFromParticipant(participantId);
     const payload = toLifecyclePayload(row);
     return NextResponse.json(
       accountingInitialFees ? { ...payload, accountingInitialFees } : payload,

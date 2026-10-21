@@ -4,6 +4,7 @@ import { EDGE_CORS_HEADERS, edgeCorsOptions } from "@/lib/edge-cors";
 import { requireStaff, forbidden, unauthorized } from "@/lib/staff-edge-auth";
 import { toLifecyclePayload } from "@/lib/pmes-edge/admin-lifecycle";
 import { selectAdminLifecycleRowByParticipantId } from "@/lib/pmes-edge/admin-participant-queries";
+import { syncApplicationFromParticipant } from "@/lib/membership/edge-service";
 
 export function OPTIONS() {
   return edgeCorsOptions();
@@ -91,6 +92,7 @@ export async function POST(request: Request) {
       return NextResponse.json({ message: "Participant not found", statusCode: 404 }, { status: 404, headers: EDGE_CORS_HEADERS });
     }
 
+    await syncApplicationFromParticipant(participantId);
     return NextResponse.json(toLifecyclePayload(row), { headers: EDGE_CORS_HEADERS });
   } catch (e) {
     const message = e instanceof Error ? e.message : "Unauthorized";

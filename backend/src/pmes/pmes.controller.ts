@@ -201,7 +201,9 @@ export class PmesController {
   @Post("admin/participant/secretary-confirm")
   @UseGuards(StaffJwtGuard)
   adminSecretaryConfirm(@Req() req: StaffRequest, @Body() dto: SecretaryConfirmDto) {
-    return this.pmes.recordSecretaryBoardConfirmation(dto.participantId, req.staffUser);
+    return this.pmes.recordSecretaryBoardConfirmation(dto.participantId, req.staffUser, {
+      forcePmesOverride: dto.forcePmesOverride === true,
+    });
   }
 
   /** Admin: searchable member registry (full members by default). */

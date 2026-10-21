@@ -151,3 +151,35 @@ export async function identityToolkitPatchUser(
 export function normalizeMemberEmail(email: string): string {
   return normalizeEmail(email);
 }
+
+/** Server-side Firebase account create (FEAT-004 submit). */
+export async function identityToolkitSignUp(
+  projectId: string,
+  email: string,
+  password: string,
+  displayName: string,
+): Promise<{ localId: string; email?: string }> {
+  const out = await identityToolkitPost(projectToolkitPath(projectId, "accounts:signUp"), {
+    email: normalizeEmail(email),
+    password,
+    displayName,
+    returnSecureToken: false,
+  });
+  const localId = String(out.localId ?? "");
+  if (!localId) throw new Error("Firebase signUp did not return a uid");
+  return { localId, email: typeof out.email === "string" ? out.email : email };
+}
+
+export async function identityToolkitDeleteUser(projectId: string, localId: string): Promise<void> {
+  const uid = localId.trim();
+  if (!uid) throw new Error("Firebase UID is required");
+  await identityToolkitPost(projectToolkitPath(projectId, "accounts:delete"), { localId: uid });
+}
+
+/** PASSWORD_RESET via sendOobCode — Firebase Auth sends the email (no returnOobLink). */
+export async function identityToolkitSendPasswordReset(projectId: string, email: string): Promise<void> {
+  await identityToolkitPost(projectToolkitPath(projectId, "accounts:sendOobCode"), {
+    requestType: "PASSWORD_RESET",
+    email: normalizeEmail(email),
+  });
+}

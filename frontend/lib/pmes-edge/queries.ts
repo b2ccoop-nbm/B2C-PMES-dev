@@ -14,6 +14,7 @@ export type ParticipantCore = {
   legacyPioneerImport: boolean;
   memberIdNo: string | null;
   tinNo: string | null;
+  tinMissingFlaggedAt?: string | Date | null;
   initialFeesPaidAt: string | Date | null;
   bodMajorityReachedAt: string | Date | null;
   boardResolutionNo: string | null;

@@ -12,4 +12,9 @@ export class UpdateParticipantMembershipDto {
   @IsOptional()
   @IsBoolean()
   boardApproved?: boolean;
+
+  /** Superuser only: bypass the PMES-passed gate when recording boardApproved. */
+  @IsOptional()
+  @IsBoolean()
+  forcePmesOverride?: boolean;
 }

@@ -74,6 +74,10 @@ import { MemberPatronageCard } from "./components/MemberPatronageCard.jsx";
 import { MemberPassbookCard } from "./components/MemberPassbookCard.jsx";
 import { TreasurerMembershipPaymentActions } from "./components/TreasurerMembershipPaymentActions.jsx";
 import { MemberSubmissionAckScreen } from "./components/MemberSubmissionAckScreen.jsx";
+import { RegisterApp } from "./../lib/register-ui/RegisterApp";
+import { TinPromptModal } from "./components/TinPromptModal.jsx";
+import { ApplicationChecklist } from "./components/ApplicationChecklist.jsx";
+import { OnlineApplicationsAdmin } from "./components/OnlineApplicationsAdmin.jsx";
 import { PIONEER_POINTS_PER_JOIN } from "./lib/referralTiers.js";
 import { PUBLIC_MEMBER_COUNT } from "./constants/cooperativeBrand.js";
 import { derivePmesIntent } from "./lib/pmesIntent.js";
@@ -347,6 +351,9 @@ function formatTtsError(err) {
 }
 
 export default function App() {
+  const [registerPath, setRegisterPath] = useState(/** @type {string | null} */ (null));
+  const [tinPromptOpen, setTinPromptOpen] = useState(false);
+  const [tinDismissedThisView, setTinDismissedThisView] = useState(false);
   const [appState, setAppState] = useState("landing");
   const appStateRef = useRef(appState);
   useEffect(() => {
@@ -387,10 +394,27 @@ export default function App() {
         const next = `${window.location.pathname}${qs ? `?${qs}` : ""}${window.location.hash}`;
         window.history.replaceState({}, "", next);
       }
+      const path = window.location.pathname.replace(/\/$/, "") || "/";
+      if (path === "/register" || path.startsWith("/register/") || path === "/set-password") {
+        setRegisterPath(path);
+      }
     } catch {
       /* sessionStorage / history may be unavailable */
     }
   }, []);
+
+  useEffect(() => {
+    if (!user?.email) {
+      setTinDismissedThisView(false);
+      setTinPromptOpen(false);
+      return;
+    }
+    if (membershipLifecycle?.needsTin === true && !tinDismissedThisView) {
+      setTinPromptOpen(true);
+    } else if (membershipLifecycle?.needsTin !== true) {
+      setTinPromptOpen(false);
+    }
+  }, [membershipLifecycle?.needsTin, user?.email, tinDismissedThisView]);
 
   const [signUp, setSignUp] = useState({
     firstName: "",
@@ -2063,6 +2087,35 @@ export default function App() {
     );
   }
 
+  if (registerPath) {
+    return (
+      <RegisterApp
+        initialPath={registerPath}
+        onExitToHome={() => {
+          setRegisterPath(null);
+          if (typeof window !== "undefined") window.history.pushState({}, "", "/");
+          setAppState("landing");
+        }}
+      />
+    );
+  }
+
+  const tinModal = (
+    <TinPromptModal
+      open={tinPromptOpen}
+      onDismiss={() => {
+        setTinDismissedThisView(true);
+        setTinPromptOpen(false);
+      }}
+      onSave={async (tin) => {
+        const idToken = await auth.currentUser?.getIdToken();
+        await PmesService.patchMemberBasicProfile({ email: user.email, tinNo: tin, idToken });
+        await refreshMembershipLifecycle();
+        setTinPromptOpen(false);
+      }}
+    />
+  );
+
   if (appState === "member_auth") {
     const isSignup = memberAuthMode === "signup";
     return (
@@ -2113,6 +2166,14 @@ export default function App() {
                 <p className="text-xs font-black uppercase tracking-widest text-[#004aad]/80">
                   {isSignup ? "New registration" : "Member sign-in"}
                 </p>
+                {isSignup ? (
+                  <p className="mt-2 text-sm font-medium text-slate-600">
+                    Prefer the official membership form?{" "}
+                    <a href="/register" className="font-black text-[#004aad] underline">
+                      Apply online
+                    </a>
+                  </p>
+                ) : null}
                 <h2 className="mt-1 text-2xl font-black tracking-tight text-slate-900 sm:text-3xl">
                   {isSignup ? "Create your login" : "Log in to continue"}
                 </h2>
@@ -3619,6 +3680,8 @@ export default function App() {
           <style dangerouslySetInnerHTML={{ __html: globalStyles }} />
           <div className="flex w-full max-w-5xl flex-col gap-10">
             {memberPortalIdentityInline}
+            {tinModal}
+            <ApplicationChecklist lifecycle={membershipLifecycle} />
             <div className="flex flex-wrap justify-center gap-3">
               <button
                 type="button"
@@ -5438,6 +5501,12 @@ export default function App() {
               </div>
             ) : null}
           </div>
+          <OnlineApplicationsAdmin
+            staffAccessToken={staffAccessToken}
+            staffRole={staffRole}
+            apiBase={(import.meta.env.VITE_API_BASE_URL || "").replace(/\/$/, "")}
+            onRefreshPipeline={() => void refreshMembershipPipelineRows()}
+          />
           <div className="border-t border-slate-200 bg-slate-50 px-6 py-3 lg:px-10">
             <button
               type="button"
@@ -5580,6 +5649,11 @@ export default function App() {
                                   BOD no
                                 </button>
                               </>
+                            ) : null}
+                            {needSecretary ? (
+                              <span className="text-[10px] font-black uppercase text-slate-500">
+                                PMES {row.pmEsPassed ? "passed" : "not completed"}
+                              </span>
                             ) : null}
                             {needSecretary && canSecretary ? (
                               <button
@@ -5756,6 +5830,11 @@ export default function App() {
                           BOD no
                         </button>
                       </>
+                    ) : null}
+                    {needSecretary ? (
+                      <span className="text-[10px] font-black uppercase text-slate-500">
+                        PMES {row.pmEsPassed ? "passed" : "not completed"}
+                      </span>
                     ) : null}
                     {needSecretary && canSecretary ? (
                       <button

@@ -5,6 +5,8 @@ import { requireStaff, forbidden, unauthorized } from "@/lib/staff-edge-auth";
 import { BOD_MAJORITY_APPROVALS } from "@/lib/pmes-edge/board-workflow.constants";
 import { toLifecyclePayload } from "@/lib/pmes-edge/admin-lifecycle";
 import { selectAdminLifecycleRowByParticipantId } from "@/lib/pmes-edge/admin-participant-queries";
+import { assertPmesPassedForSecretary, forcePmesOverrideAudit } from "@/lib/membership/pmes-gate";
+import { syncApplicationFromParticipant } from "@/lib/membership/edge-service";
 
 const MONTHS = [
   "JAN",
@@ -47,7 +49,7 @@ export async function POST(request: Request) {
       return forbidden("Your account is not the Secretary.", EDGE_CORS_HEADERS);
     }
 
-    const body = (await request.json().catch(() => null)) as { participantId?: string } | null;
+    const body = (await request.json().catch(() => null)) as { participantId?: string; forcePmesOverride?: boolean } | null;
     const participantId = String(body?.participantId ?? "").trim();
     if (!participantId) {
       return NextResponse.json(
@@ -95,6 +97,28 @@ export async function POST(request: Request) {
       );
     }
 
+    const pmesRows = await sql`
+      SELECT id FROM "PmesRecord" WHERE "participantId" = ${participantId} AND passed = true LIMIT 1
+    `;
+    const pmesPassed = (pmesRows as { id: string }[]).length > 0;
+    const force = body?.forcePmesOverride === true;
+    const gate = assertPmesPassedForSecretary(pmesPassed, {
+      force,
+      actorRole: staff.role,
+    });
+    if (!gate.ok) {
+      return NextResponse.json({ message: gate.message, statusCode: 400 }, { status: 400, headers: EDGE_CORS_HEADERS });
+    }
+    const audit = forcePmesOverrideAudit({
+      participantId,
+      actorRole: staff.role,
+      force,
+      pmesPassed,
+    });
+    if (audit.shouldLog) {
+      console.warn(audit.message);
+    }
+
     const now = new Date();
     const year = now.getUTCFullYear();
     const month = now.getUTCMonth() + 1;
@@ -132,6 +156,7 @@ export async function POST(request: Request) {
       return NextResponse.json({ message: "Participant not found", statusCode: 404 }, { status: 404, headers: EDGE_CORS_HEADERS });
     }
 
+    await syncApplicationFromParticipant(participantId);
     return NextResponse.json(toLifecyclePayload(lifecycleRow), { headers: EDGE_CORS_HEADERS });
   } catch (e) {
     const message = e instanceof Error ? e.message : "Unauthorized";

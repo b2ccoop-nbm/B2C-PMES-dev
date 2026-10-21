@@ -50,6 +50,12 @@ export const envValidationSchema = Joi.object({
 
   /** B2C-Store service auth — GET /integrations/v1/members/resolve */
   STORE_INTEGRATION_SECRET: Joi.string().allow(""),
+
+  TURNSTILE_SECRET_KEY: Joi.string().allow(""),
+  MEMBERSHIP_CRON_SECRET: Joi.string().allow(""),
+  DPA_CONSENT_VERSION: Joi.string().allow(""),
+  PUBLIC_APP_URL: Joi.string().allow(""),
+  MEMBERSHIP_FIREBASE_MOCK: Joi.string().allow(""),
 })
   .custom((value, helpers) => {
     const v = value as {
