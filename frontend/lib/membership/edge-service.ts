@@ -7,11 +7,9 @@ import {
   initialsFromFullName,
 } from "@/lib/pmes-edge/member-public-id";
 import { blockingFinding, evaluateDuplicates, firstFlaggedParticipantId, type DuplicateLookup } from "@/lib/membership/duplicate-engine";
-import { approvedEmail, rejectedEmail, resumeEmail, setPasswordEmail, treasurerPromptEmail } from "@/lib/membership/email-templates";
 import { publicCreateForExistingApplication } from "@/lib/membership/existing-draft-policy";
 import { membershipScreenshotPath } from "@/lib/membership/staff-access";
 import { createFirebaseMemberAccount, deleteFirebaseMemberAccount } from "@/lib/membership/firebase-signup";
-import { sendMembershipEmail } from "@/lib/membership/mailer";
 import { draftIpWindow, isRateLimited, lookupIpWindow, submitEmailWindow } from "@/lib/membership/rate-limit";
 import { referrerConflictMessage } from "@/lib/membership/referrer-rules";
 import { derivedApplicationStatus, nextStatusAfterLifecycle } from "@/lib/membership/status-sync";
@@ -286,27 +284,7 @@ async function allocateMemberIdWithRetry(
   throw last instanceof Error ? last : new Error(`Could not allocate a unique member ID after ${MEMBER_ID_COLLISION_RETRIES} retries.`);
 }
 
-async function notifyTreasurers(sql: Sql, row: ApplicationRow, memberIdNo?: string | null) {
-  const staff = await sql`
-    SELECT email FROM "StaffUser" WHERE role IN ('TREASURER', 'SUPERUSER')
-  `;
-  let targets = staff as { email: string }[];
-  if (!targets.length) {
-    targets = (await sql`SELECT email FROM "StaffUser" WHERE role = 'ADMIN'`) as { email: string }[];
-  }
-  for (const t of targets) {
-    await sendMembershipEmail(
-      treasurerPromptEmail({
-        to: t.email,
-        applicantName: row.fullName || row.email,
-        applicantEmail: row.email,
-        memberIdNo,
-        declaredPaid: Boolean(row.shareCapitalPaid || row.membershipFeePaid),
-        paymentMode: row.paymentMode,
-        gcashRefNo: row.gcashRefNo,
-      }),
-    ).catch(() => undefined);
-  }
+async function notifyTreasurers(sql: Sql, row: ApplicationRow) {
   await sql`UPDATE "MembershipApplication" SET "treasurerNotifiedAt" = NOW(), "updatedAt" = NOW() WHERE id = ${row.id}`;
 }
 
@@ -336,17 +314,6 @@ export async function createDraft(input: {
   const open = (existing as ApplicationRow[])[0];
   if (open) {
     const policy = publicCreateForExistingApplication(open.status);
-    if (policy.emailContinue) {
-      const pending = await generateResumeToken();
-      const pendingHash = await hashResumeToken(pending);
-      const pendingExp = resumeTokenExpiresAt();
-      await sql`
-        UPDATE "MembershipApplication"
-        SET "pendingResumeTokenHash" = ${pendingHash}, "pendingResumeTokenExpiresAt" = ${pendingExp}, "updatedAt" = NOW()
-        WHERE id = ${open.id}
-      `;
-      await sendMembershipEmail(resumeEmail({ to: email, continueUrl: continueUrl(publicAppUrl(), pending) })).catch(() => undefined);
-    }
     return { ok: true as const, status: 200, body: { checkEmail: true, message: policy.message } };
   }
   let referrer: string | null = null;
@@ -374,8 +341,16 @@ export async function createDraft(input: {
     RETURNING *
   `;
   const row = (created as ApplicationRow[])[0]!;
-  await sendMembershipEmail(resumeEmail({ to: email, continueUrl: continueUrl(publicAppUrl(), token) })).catch(() => undefined);
-  return { ok: true as const, status: 201, body: { ...toPublicApplication(row), resumeToken: token, resumed: false } };
+  return {
+    ok: true as const,
+    status: 201,
+    body: {
+      ...toPublicApplication(row),
+      resumeToken: token,
+      continueUrl: continueUrl(publicAppUrl(), token),
+      resumed: false,
+    },
+  };
 }
 
 export async function getDraft(id: string, token: string) {
@@ -643,15 +618,7 @@ export async function submitDraft(id: string, token: string, input: { captchaTok
     return jsonError(e instanceof Error ? e.message : "Could not link Firebase login", 400);
   }
 
-  await sendMembershipEmail(
-    setPasswordEmail({
-      to: row.email,
-      fullName,
-      memberIdNo,
-      setPasswordUrl: firebase.resetLink || `${publicAppUrl()}/set-password`,
-    }),
-  ).catch(() => undefined);
-  await notifyTreasurers(sql, next, memberIdNo);
+  await notifyTreasurers(sql, next);
   return {
     ok: true as const,
     status: 200,
@@ -661,7 +628,7 @@ export async function submitDraft(id: string, token: string, input: { captchaTok
       memberIdNo,
       participantId: existingRow?.id ?? participantId,
       needsTin: !tin,
-      passwordEmailQueued: true,
+      passwordEmailSent: firebase.passwordEmailSent,
     },
   };
 }
@@ -670,18 +637,7 @@ export async function resendResume(id: string, token: string) {
   const sql = getSql();
   const loaded = await loadByToken(sql, id, token);
   if (loaded.error) return loaded.error;
-  const pending = await generateResumeToken();
-  const pendingHash = await hashResumeToken(pending);
-  const pendingExp = resumeTokenExpiresAt();
-  await sql`
-    UPDATE "MembershipApplication"
-    SET "pendingResumeTokenHash" = ${pendingHash}, "pendingResumeTokenExpiresAt" = ${pendingExp}, "updatedAt" = NOW()
-    WHERE id = ${id}
-  `;
-  await sendMembershipEmail(
-    resumeEmail({ to: loaded.row.email, continueUrl: continueUrl(publicAppUrl(), pending) }),
-  ).catch(() => undefined);
-  return { ok: true as const, status: 200, body: { ok: true, emailed: true } };
+  return { ok: true as const, status: 200, body: { ok: true, continueUrl: continueUrl(publicAppUrl(), token) } };
 }
 
 export async function claimResume(token: string) {
@@ -838,6 +794,13 @@ export async function adminListApplications(query: { status?: string; q?: string
       AND ("shareCapitalPaid" = true OR "membershipFeePaid" = true)
       AND "paymentConfirmedAt" IS NULL
   `;
+  const noticed = await sql`
+    SELECT COUNT(*)::int AS c FROM "MembershipApplication"
+    WHERE status = 'SUBMITTED'
+      AND ("shareCapitalPaid" = true OR "membershipFeePaid" = true)
+      AND "paymentConfirmedAt" IS NULL
+      AND "treasurerNotifiedAt" IS NOT NULL
+  `;
   return {
     applications: (rows as Array<ApplicationRow & { memberIdNo: string | null; initialFeesPaidAt: string | null; boardApprovedAt: string | null }>).map((r) => ({
       ...toPublicApplication(r),
@@ -847,7 +810,10 @@ export async function adminListApplications(query: { status?: string; q?: string
       flaggedPossibleDuplicate: Boolean(r.possibleDuplicateOfId),
       screenshotUrl: r.gcashScreenshotKey ? membershipScreenshotPath(r.id) : null,
     })),
-    inbox: { paymentsToConfirm: Number((pending as { c: number }[])[0]?.c ?? 0) },
+    inbox: {
+      paymentsToConfirm: Number((pending as { c: number }[])[0]?.c ?? 0),
+      treasurerNotice: Number((noticed as { c: number }[])[0]?.c ?? 0) > 0,
+    },
   };
 }
 
@@ -904,7 +870,6 @@ export async function adminReject(id: string, staff: { role: string }, reason: s
   `;
   const row = (updated as ApplicationRow[])[0];
   if (!row) return jsonError("Application not found", 404);
-  await sendMembershipEmail(rejectedEmail({ to: row.email, fullName: row.fullName || row.email, reason: why })).catch(() => undefined);
   return { ok: true as const, status: 200, body: toPublicApplication(row) };
 }
 
@@ -943,16 +908,13 @@ export async function adminPatchReferrer(id: string, staff: { role: string }, re
 export async function syncApplicationFromParticipant(participantId: string) {
   const sql = getSql();
   const pRows = await sql`
-    SELECT "initialFeesPaidAt", "bodMajorityReachedAt", "boardApprovedAt", email, "fullName", "memberIdNo"
+    SELECT "initialFeesPaidAt", "bodMajorityReachedAt", "boardApprovedAt"
     FROM "Participant" WHERE id = ${participantId} LIMIT 1
   `;
   const p = (pRows as {
     initialFeesPaidAt: string | null;
     bodMajorityReachedAt: string | null;
     boardApprovedAt: string | null;
-    email: string;
-    fullName: string;
-    memberIdNo: string | null;
   }[])[0];
   if (!p) return;
   const aRows = await sql`SELECT id, status FROM "MembershipApplication" WHERE "participantId" = ${participantId} LIMIT 1`;
@@ -962,8 +924,5 @@ export async function syncApplicationFromParticipant(participantId: string) {
   const next = nextStatusAfterLifecycle(app.status, derived);
   if (next !== app.status) {
     await sql`UPDATE "MembershipApplication" SET status = ${next}::"MembershipApplicationStatus", "updatedAt" = NOW() WHERE id = ${app.id}`;
-    if (next === "APPROVED" && p.memberIdNo) {
-      await sendMembershipEmail(approvedEmail({ to: p.email, fullName: p.fullName, memberIdNo: p.memberIdNo })).catch(() => undefined);
-    }
   }
 }

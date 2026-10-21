@@ -17,8 +17,10 @@ describe("Worker QA D must-fixes", () => {
     const submitted = publicCreateForExistingApplication("SUBMITTED");
     expect(draft.rotateToken).toBe(false);
     expect(draft.returnPii).toBe(false);
-    expect(draft.emailContinue).toBe(true);
-    expect(submitted.emailContinue).toBe(false);
+    expect(draft.issueContinue).toBe(false);
+    expect(submitted.issueContinue).toBe(false);
+    expect(draft.message).toBe(submitted.message);
+    expect(draft.message).not.toMatch(/check your email|emailed/i);
   });
 
   it("C2: cron fails closed when the secret is unset or wrong", () => {

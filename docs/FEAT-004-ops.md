@@ -19,19 +19,18 @@ Resolve any duplicate `memberIdNo` or `tinNo` rows before deploying the unique i
 |---|---|
 | `TURNSTILE_SECRET_KEY` | Cloudflare Turnstile verify on create + submit |
 | `NEXT_PUBLIC_TURNSTILE_SITE_KEY` / `VITE_TURNSTILE_SITE_KEY` | Browser widget (optional until enabled) |
-| `GMAIL_SENDING_ENABLED` | `true` only after Nilo grants Gmail OAuth for **b2ccoop@gmail.com** |
-| `GMAIL_OAUTH_CLIENT_ID` | Gmail API OAuth client |
-| `GMAIL_OAUTH_CLIENT_SECRET` | Gmail API OAuth secret |
-| `GMAIL_OAUTH_REFRESH_TOKEN` | Refresh token for b2ccoop@gmail.com |
-| `GMAIL_FROM` | Default `b2ccoop@gmail.com` |
 | `MEMBERSHIP_CRON_SECRET` | Required. Cron **fails closed** (401) if unset or wrong |
-| `PUBLIC_APP_URL` | Used in emailed continue / set-password links |
+| `PUBLIC_APP_URL` | Used in on-screen continue links (`/register/continue#c=…`) |
 | `MEMBERSHIP_UPLOADS` | R2 bucket binding (private GCash screenshots) |
-| Existing `FIREBASE_PROJECT_ID`, `FIREBASE_CLIENT_EMAIL`, `FIREBASE_PRIVATE_KEY` | Server-side `accounts:signUp` + `sendOobCode` |
+| Existing `FIREBASE_PROJECT_ID`, `FIREBASE_CLIENT_EMAIL`, `FIREBASE_PRIVATE_KEY` | Server-side `accounts:signUp` + `accounts:sendOobCode` |
 
-Until Gmail OAuth is granted, leave `GMAIL_SENDING_ENABLED` unset/false. The mailer returns `{ mocked: true }` and tests must keep it off.
+There is **no Gmail OAuth**. Applicant set-password mail is Firebase Auth only: Identity Toolkit `sendOobCode` with `requestType=PASSWORD_RESET` (no `returnOobLink`). Firebase's project email templates send the message.
 
-Turnstile verify **fails closed** when `TURNSTILE_SECRET_KEY` is unset (except `NODE_ENV=test`). CORS is an allowlist (`b2ccoop.com` + localhost + `PUBLIC_APP_URL` / `MEMBERSHIP_CORS_ORIGINS`), never `*`. Resume tokens are hashed, expire in 30 days, and are emailed as `/register/continue#c=…` (not `?t=`). Drafts are expired **and purged** at 60 days from `createdAt`.
+Draft continue links **cannot** use Firebase templates: `EMAIL_SIGNIN` would create a Firebase user before submit. The continue URL is shown on screen once when a new draft is created, stored on that device, and shown again in the member portal checklist when this browser saved it. Public create on an existing email never returns a token or a link (C1).
+
+Treasurer / staff notices are **in-app only**: the Payments to confirm badge + queue, plus `inbox.treasurerNotice` after the cron stamps `treasurerNotifiedAt`. Approval and rejection stay in the member portal; they are not emailed.
+
+Turnstile verify **fails closed** when `TURNSTILE_SECRET_KEY` is unset (except `NODE_ENV=test`). CORS is an allowlist (`b2ccoop.com` + localhost + `PUBLIC_APP_URL` / `MEMBERSHIP_CORS_ORIGINS`), never `*`. Resume tokens are hashed and expire in 30 days. Drafts are expired **and purged** at 60 days from `createdAt`.
 
 ## Cloudflare WAF (document only — do not attach to prod in this PR)
 
@@ -52,7 +51,7 @@ App-level limits (Neon `MembershipRateLimit`) already enforce:
 `POST /api/membership/cron` with `X-Cron-Secret`:
 
 1. Expire + purge drafts older than 60 days
-2. Re-send Treasurer payment reminders for submitted, declared-paid, unconfirmed applications
+2. Stamp `treasurerNotifiedAt` on submitted, declared-paid, unconfirmed applications (in-app reminder flag; no email)
 
 Example Wrangler trigger (do not deploy from this PR):
 
@@ -66,16 +65,17 @@ Example Wrangler trigger (do not deploy from this PR):
 - [ ] GCash with screenshot
 - [ ] GCash without screenshot
 - [ ] Submit before paying
-- [ ] Treasurer queue + notification (mail mocked until OAuth)
+- [ ] Treasurer queue + in-app notice (no staff email)
 - [ ] Secretary blocked until PMES passed
 - [ ] Superuser force override logged
 - [ ] TIN prompt on every sign-in until saved
 - [ ] Under-18 rejected
 - [ ] Non-approved referrer rejected
 - [ ] Draft expiry at 60 days (cron)
-- [ ] Auto-save resume on a second device via emailed continue link
+- [ ] Auto-save resume on a second device via on-screen continue link
 - [ ] Duplicate email / mobile / TIN / name+DOB / legacy reclaim
 - [ ] FEAT-003 referral credit still fires once (`referralJoinCreditedAt` set-once)
-- [ ] Reject path emails applicant
+- [ ] Reject path updates status in-app only
 - [ ] `memberIdNo` uniqueness + collision retry
 - [ ] Mobile viewport (Android Chrome / iOS Safari)
+- [ ] Submit sends Firebase password-reset email (not Gmail API)

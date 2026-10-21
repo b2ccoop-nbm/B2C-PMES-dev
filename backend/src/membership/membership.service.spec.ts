@@ -98,7 +98,7 @@ function firebasePort() {
   return {
     lookupByEmail: jest.fn().mockResolvedValue(null),
     signUp: jest.fn().mockResolvedValue({ localId: "fb-uid-1", email: "juan@example.com" }),
-    passwordResetLink: jest.fn().mockResolvedValue("https://example.test/reset?oob=1"),
+    sendPasswordResetEmail: jest.fn().mockResolvedValue(undefined),
     deleteUser: jest.fn().mockResolvedValue(undefined),
   };
 }
@@ -122,13 +122,14 @@ describe("MembershipService", () => {
       dpaConsent: true,
       ip: "1.1.1.1",
     });
-    expect(out).toEqual({ checkEmail: true, message: "Check your email to continue." });
+    expect(out.checkEmail).toBe(true);
+    expect(out.message).toMatch(/already in progress/i);
+    expect(out.message).not.toMatch(/check your email|emailed/i);
     expect(out).not.toHaveProperty("resumeToken");
+    expect(out).not.toHaveProperty("continueUrl");
     expect(out).not.toHaveProperty("tinNo");
-    const update = prisma.membershipApplication.update.mock.calls[0][0];
-    expect(update.data.resumeTokenHash).toBeUndefined();
-    expect(update.data.pendingResumeTokenHash).toBeTruthy();
-    expect(update.data.pendingResumeTokenHash).not.toBe(priorHash);
+    expect(prisma.membershipApplication.update).not.toHaveBeenCalled();
+    expect(priorHash).toBe(open.resumeTokenHash);
   });
 
   it("does not treat a submitted application as publicly resumable", async () => {
@@ -212,11 +213,37 @@ describe("MembershipService", () => {
     await expect(service.submit(row.id, "resume-token-plain", { ip: "1.1.1.1" })).rejects.toBeInstanceOf(ConflictException);
   });
 
-  it("queues treasurer notification on confirm-needed submit", async () => {
+  it("stamps an in-app treasurer notice on confirm-needed submit", async () => {
     const row = draftRow({ shareCapitalPaid: true, membershipFeePaid: true, paymentMode: "CASH" });
+    const { service, prisma, firebase } = serviceFor(row);
+    const out = await service.submit(row.id, "resume-token-plain", { ip: "1.1.1.1" });
+    expect(out.passwordEmailSent).toBe(true);
+    expect(firebase.sendPasswordResetEmail).toHaveBeenCalledWith(row.email);
+    expect(prisma.staffUser.findMany).not.toHaveBeenCalled();
+    const stamp = prisma.membershipApplication.update.mock.calls.find(
+      (c: [{ data?: { treasurerNotifiedAt?: Date } }]) => c[0]?.data?.treasurerNotifiedAt,
+    );
+    expect(stamp?.[0].data.treasurerNotifiedAt).toBeInstanceOf(Date);
+  });
+
+  it("returns the live continue URL to an authorized resend caller", async () => {
+    const row = draftRow();
     const { service, prisma } = serviceFor(row);
-    await service.submit(row.id, "resume-token-plain", { ip: "1.1.1.1" });
-    expect(prisma.staffUser.findMany).toHaveBeenCalled();
+    const out = await service.resendResumeLink(row.id, "resume-token-plain");
+    expect(out.continueUrl).toMatch(/\/register\/continue#c=resume-token-plain/);
+    expect(prisma.membershipApplication.update).not.toHaveBeenCalled();
+  });
+
+  it("returns an on-screen continue URL for a new draft", async () => {
+    const { service, prisma } = serviceFor(draftRow());
+    prisma.membershipApplication.findFirst.mockResolvedValueOnce(null);
+    const out = await service.createDraft({
+      email: "fresh@example.com",
+      dpaConsent: true,
+      ip: "2.2.2.2",
+    });
+    expect("continueUrl" in out && out.continueUrl).toMatch(/\/register\/continue#c=/);
+    expect("resumeToken" in out && out.resumeToken).toBeTruthy();
   });
 
   it("expires drafts older than 60 days and purges by createdAt in the same run", async () => {
@@ -336,6 +363,8 @@ describe("MembershipService", () => {
     expect(app.flaggedPossibleDuplicate).toBe(true);
     expect(app.screenshotUrl).toBe("/pmes/admin/membership-applications/app-1/screenshot");
     expect(JSON.stringify(app)).not.toContain("secret.webp");
+    expect(list.inbox.paymentsToConfirm).toBe(1);
+    expect(list.inbox.treasurerNotice).toBe(true);
   });
 
   it("serves screenshots only to treasurer/secretary/superuser and never leaks the key", async () => {

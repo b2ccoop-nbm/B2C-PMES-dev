@@ -5,6 +5,7 @@ const LIST_ROLES = ["treasurer", "secretary", "superuser"];
 export function OnlineApplicationsAdmin({ staffAccessToken, staffRole, apiBase, onRefreshPipeline }) {
   const [rows, setRows] = useState([]);
   const [inbox, setInbox] = useState(0);
+  const [treasurerNotice, setTreasurerNotice] = useState(false);
   const [status, setStatus] = useState("");
   const [q, setQ] = useState("");
   const [detail, setDetail] = useState(null);
@@ -24,6 +25,7 @@ export function OnlineApplicationsAdmin({ staffAccessToken, staffRole, apiBase, 
     const json = await res.json();
     setRows(json.applications || []);
     setInbox(Number(json.inbox?.paymentsToConfirm ?? 0));
+    setTreasurerNotice(Boolean(json.inbox?.treasurerNotice));
   }
 
   useEffect(() => {
@@ -45,6 +47,11 @@ export function OnlineApplicationsAdmin({ staffAccessToken, staffRole, apiBase, 
           Payments to confirm {inbox}
         </span>
       </div>
+      {treasurerNotice ? (
+        <p className="mt-3 rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm font-semibold text-amber-950">
+          Reminder: declared payments are waiting for confirmation. This notice stays in-app (no staff email).
+        </p>
+      ) : null}
       <div className="mt-4 flex flex-wrap gap-2">
         <input className="input-field" placeholder="Search name / email" value={q} onChange={(e) => setQ(e.target.value)} />
         <select className="input-field" value={status} onChange={(e) => setStatus(e.target.value)}>

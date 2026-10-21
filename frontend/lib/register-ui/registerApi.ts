@@ -26,10 +26,30 @@ export type RegisterApplication = {
   hasGcashScreenshot: boolean;
   dpaConsentAt: string | null;
   resumeToken?: string;
+  continueUrl?: string;
   memberIdNo?: string;
   checkEmail?: boolean;
   message?: string;
+  passwordEmailSent?: boolean;
 };
+
+const CONTINUE_KEY = "b2c_membership_continue";
+
+export function rememberContinueUrl(url: string) {
+  try {
+    sessionStorage.setItem(CONTINUE_KEY, url);
+  } catch {
+    /* ignore */
+  }
+}
+
+export function readStoredContinueUrl(): string | null {
+  try {
+    return sessionStorage.getItem(CONTINUE_KEY);
+  } catch {
+    return null;
+  }
+}
 
 function apiBase(): string {
   if (typeof window === "undefined") return "";
@@ -81,6 +101,7 @@ export async function createApplication(input: {
 }): Promise<RegisterApplication> {
   const body = await req("/membership/applications", { method: "POST", body: JSON.stringify(input) });
   if (body.id && body.resumeToken) rememberResume(body.id, body.resumeToken);
+  if (typeof body.continueUrl === "string" && body.continueUrl) rememberContinueUrl(body.continueUrl);
   return body;
 }
 

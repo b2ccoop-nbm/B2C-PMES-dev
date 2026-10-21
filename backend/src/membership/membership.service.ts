@@ -9,12 +9,7 @@ import {
   Optional,
   UnauthorizedException,
 } from "@nestjs/common";
-import {
-  MembershipApplicationStatus,
-  PaymentMode,
-  Prisma,
-  StaffRole,
-} from "@prisma/client";
+import { MembershipApplicationStatus, PaymentMode, Prisma } from "@prisma/client";
 import { AccountingClientService } from "../integrations/accounting-client.service";
 import { PrismaService } from "../prisma/prisma.service";
 import type { StaffJwtRole } from "../auth/staff-jwt.guard";
@@ -26,9 +21,7 @@ import {
   type DuplicateLookup,
   type ExistingParticipantLite,
 } from "./duplicate-engine";
-import { approvedEmail, rejectedEmail, resumeEmail, setPasswordEmail, treasurerPromptEmail } from "./email-templates";
 import { createFirebaseMemberAccount, type FirebaseAccountsPort } from "./firebase-accounts";
-import { sendMembershipEmail } from "./mailer";
 import { allocateMemberPublicId, maskGivenName, referrerIsApproved } from "./member-id-alloc";
 import { draftIpWindow, isRateLimited, lookupIpWindow, submitEmailWindow } from "./rate-limit";
 import { derivedApplicationStatus, nextStatusAfterLifecycle } from "./status-sync";
@@ -252,17 +245,6 @@ export class MembershipService {
     });
     if (existing) {
       const policy = publicCreateForExistingApplication(existing.status);
-      if (policy.emailContinue) {
-        const pending = generateResumeToken();
-        await this.prisma.membershipApplication.update({
-          where: { id: existing.id },
-          data: {
-            pendingResumeTokenHash: hashResumeToken(pending),
-            pendingResumeTokenExpiresAt: resumeTokenExpiresAt(),
-          },
-        });
-        await this.maybeEmailResume(email, pending);
-      }
       return { checkEmail: true as const, message: policy.message };
     }
 
@@ -290,8 +272,12 @@ export class MembershipService {
         membershipFeeAmount: MEMBERSHIP_FEE_DEFAULT,
       },
     });
-    await this.maybeEmailResume(email, token);
-    return { ...this.publicApplication(created), resumeToken: token, resumed: false };
+    return {
+      ...this.publicApplication(created),
+      resumeToken: token,
+      continueUrl: continueUrl(this.publicAppUrl(), token),
+      resumed: false,
+    };
   }
 
   async getDraft(id: string, token: string) {
@@ -571,14 +557,14 @@ export class MembershipService {
       throw lastUniqueError instanceof Error ? lastUniqueError : new Error("Could not allocate a unique member ID.");
     }
 
-    let resetLink: string | null = null;
+    let passwordEmailSent = false;
     let firebaseUid = result.participant.firebaseUid ?? existingParticipant?.firebaseUid ?? null;
     if (firebaseUid) {
       const created = await createFirebaseMemberAccount(row.email, fullName, this.firebase);
       if (created.uid !== firebaseUid) {
         throw new ConflictException("Already registered — sign in or reset password");
       }
-      resetLink = created.resetLink;
+      passwordEmailSent = created.passwordEmailSent;
     } else {
       const created = await createFirebaseMemberAccount(row.email, fullName, this.firebase);
       const other = await this.prisma.participant.findFirst({
@@ -598,7 +584,7 @@ export class MembershipService {
           data: { firebaseUid: created.uid },
         });
         firebaseUid = created.uid;
-        resetLink = created.resetLink;
+        passwordEmailSent = created.passwordEmailSent;
       } catch (e) {
         if (created.created) {
           await this.firebase.deleteUser?.(created.uid).catch((err) =>
@@ -609,17 +595,7 @@ export class MembershipService {
       }
     }
 
-    const setPwUrl = resetLink || `${this.publicAppUrl()}/set-password`;
-    await sendMembershipEmail(
-      setPasswordEmail({
-        to: row.email,
-        fullName,
-        memberIdNo: result.participant.memberIdNo ?? "",
-        setPasswordUrl: setPwUrl,
-      }),
-    ).catch((e) => this.logger.warn(`set-password email skipped: ${e instanceof Error ? e.message : e}`));
-
-    await this.notifyTreasurers(result.application, result.participant.memberIdNo);
+    await this.notifyTreasurers(result.application);
 
     return {
       application: this.publicApplication(result.application),
@@ -627,22 +603,13 @@ export class MembershipService {
       memberIdNo: result.participant.memberIdNo,
       participantId: result.participant.id,
       needsTin: !tin,
-      passwordEmailQueued: true,
+      passwordEmailSent,
     };
   }
 
   async resendResumeLink(id: string, token: string) {
-    const row = await this.loadAuthorized(id, token);
-    const pending = generateResumeToken();
-    await this.prisma.membershipApplication.update({
-      where: { id: row.id },
-      data: {
-        pendingResumeTokenHash: hashResumeToken(pending),
-        pendingResumeTokenExpiresAt: resumeTokenExpiresAt(),
-      },
-    });
-    await this.maybeEmailResume(row.email, pending);
-    return { ok: true, emailed: true };
+    await this.loadAuthorized(id, token);
+    return { ok: true, continueUrl: continueUrl(this.publicAppUrl(), token) };
   }
 
   async claimResume(token: string) {
@@ -807,12 +774,14 @@ export class MembershipService {
       take: 200,
       include: { participant: { select: { memberIdNo: true, initialFeesPaidAt: true, boardApprovedAt: true } } },
     });
-    const pendingPayment = await this.prisma.membershipApplication.count({
-      where: {
-        status: { in: [MembershipApplicationStatus.SUBMITTED] },
-        OR: [{ shareCapitalPaid: true }, { membershipFeePaid: true }],
-        paymentConfirmedAt: null,
-      },
+    const pendingWhere: Prisma.MembershipApplicationWhereInput = {
+      status: MembershipApplicationStatus.SUBMITTED,
+      OR: [{ shareCapitalPaid: true }, { membershipFeePaid: true }],
+      paymentConfirmedAt: null,
+    };
+    const pendingPayment = await this.prisma.membershipApplication.count({ where: pendingWhere });
+    const noticed = await this.prisma.membershipApplication.count({
+      where: { ...pendingWhere, treasurerNotifiedAt: { not: null } },
     });
     return {
       applications: rows.map((r) => ({
@@ -823,7 +792,7 @@ export class MembershipService {
         flaggedPossibleDuplicate: Boolean(r.possibleDuplicateOfId),
         screenshotUrl: r.gcashScreenshotKey ? membershipScreenshotPath(r.id) : null,
       })),
-      inbox: { paymentsToConfirm: pendingPayment },
+      inbox: { paymentsToConfirm: pendingPayment, treasurerNotice: noticed > 0 },
     };
   }
 
@@ -882,9 +851,6 @@ export class MembershipService {
         rejectionReason: why.slice(0, 1000),
       },
     });
-    await sendMembershipEmail(rejectedEmail({ to: row.email, fullName: row.fullName || row.email, reason: why })).catch(
-      (e) => this.logger.warn(`reject email skipped: ${e instanceof Error ? e.message : e}`),
-    );
     return this.publicApplication(row);
   }
 
@@ -926,11 +892,6 @@ export class MembershipService {
     const next = nextStatusAfterLifecycle(app.status, derived);
     if (next !== app.status) {
       await this.prisma.membershipApplication.update({ where: { id: app.id }, data: { status: next } });
-    }
-    if (next === MembershipApplicationStatus.APPROVED && p.memberIdNo) {
-      await sendMembershipEmail(approvedEmail({ to: p.email, fullName: p.fullName, memberIdNo: p.memberIdNo })).catch(
-        (e) => this.logger.warn(`approved email skipped: ${e instanceof Error ? e.message : e}`),
-      );
     }
   }
 
@@ -984,35 +945,7 @@ export class MembershipService {
     return candidate.id;
   }
 
-  private async maybeEmailResume(email: string, token: string) {
-    const url = continueUrl(this.publicAppUrl(), token);
-    await sendMembershipEmail(resumeEmail({ to: email, continueUrl: url })).catch((e) =>
-      this.logger.warn(`resume email skipped: ${e instanceof Error ? e.message : e}`),
-    );
-  }
-
-  private async notifyTreasurers(
-    row: { id: string; fullName: string | null; email: string; shareCapitalPaid: boolean; membershipFeePaid: boolean; paymentMode: PaymentMode | null; gcashRefNo: string | null },
-    memberIdNo?: string | null,
-  ) {
-    const treasurers = await this.prisma.staffUser.findMany({
-      where: { role: { in: [StaffRole.TREASURER, StaffRole.SUPERUSER] } },
-      select: { email: true },
-    });
-    const targets = treasurers.length ? treasurers : await this.prisma.staffUser.findMany({ where: { role: StaffRole.ADMIN }, select: { email: true } });
-    for (const t of targets) {
-      await sendMembershipEmail(
-        treasurerPromptEmail({
-          to: t.email,
-          applicantName: row.fullName || row.email,
-          applicantEmail: row.email,
-          memberIdNo,
-          declaredPaid: row.shareCapitalPaid || row.membershipFeePaid,
-          paymentMode: row.paymentMode,
-          gcashRefNo: row.gcashRefNo,
-        }),
-      ).catch((e) => this.logger.warn(`treasurer email skipped: ${e instanceof Error ? e.message : e}`));
-    }
+  private async notifyTreasurers(row: { id: string }) {
     await this.prisma.membershipApplication.update({
       where: { id: row.id },
       data: { treasurerNotifiedAt: new Date() },

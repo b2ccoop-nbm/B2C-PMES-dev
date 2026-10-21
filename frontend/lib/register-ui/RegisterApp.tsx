@@ -9,6 +9,8 @@ import {
   lookupReferrer,
   patchApplication,
   readResume,
+  readStoredContinueUrl,
+  rememberContinueUrl,
   resumeByToken,
   resumeFromCookie,
   submitApplication,
@@ -36,6 +38,7 @@ export function RegisterApp({ initialPath, onExitToHome }: Props) {
   const [referrerHits, setReferrerHits] = useState<{ memberIdNo: string; displayName: string; participantId?: string }[]>([]);
   const [captchaToken, setCaptchaToken] = useState("");
   const [checkEmail, setCheckEmail] = useState<string | null>(null);
+  const [continueHref, setContinueHref] = useState<string | null>(null);
   const [form, setForm] = useState({
     email: "",
     mobile: "",
@@ -80,6 +83,8 @@ export function RegisterApp({ initialPath, onExitToHome }: Props) {
         .catch((e) => setError(e instanceof Error ? e.message : "Could not resume"));
       return;
     }
+    const storedContinue = readStoredContinueUrl();
+    if (storedContinue) setContinueHref(storedContinue);
     const stored = readResume();
     if (stored.id && stored.token) {
       void loadApplication(stored.id, stored.token)
@@ -187,8 +192,15 @@ export function RegisterApp({ initialPath, onExitToHome }: Props) {
         referralCode: form.referralQuery || undefined,
       });
       if (row.checkEmail) {
-        setCheckEmail(row.message || "Check your email to continue.");
+        setCheckEmail(
+          row.message ||
+            "An application with this email is already in progress. Continue on the device where you started it, or sign in if you already submitted.",
+        );
         return;
+      }
+      if (row.continueUrl) {
+        rememberContinueUrl(row.continueUrl);
+        setContinueHref(row.continueUrl);
       }
       applyRow(row, row.resumeToken || readResume(row.id).token || "");
       setStep(0);
@@ -244,8 +256,8 @@ export function RegisterApp({ initialPath, onExitToHome }: Props) {
       <Shell onHome={onExitToHome}>
         <h1 className="text-2xl font-black text-slate-900">Set your password</h1>
         <p className="mt-3 text-sm font-medium text-slate-600">
-          Open the set-password link from your B2C email (<strong>b2ccoop@gmail.com</strong>). After you set a password,
-          sign in with your email or member ID.
+          Open the password-reset link sent by Firebase Auth to your email. After you set a password, sign in with your
+          email or member ID.
         </p>
       </Shell>
     );
@@ -257,8 +269,9 @@ export function RegisterApp({ initialPath, onExitToHome }: Props) {
         <p className="text-xs font-black uppercase tracking-widest text-emerald-700">Application received</p>
         <h1 className="mt-2 text-2xl font-black text-slate-900">Check your email to set a password</h1>
         <p className="mt-4 text-sm font-medium text-slate-600">
-          Your login ID (member ID) is <strong>{memberId}</strong>. A set-password link was sent from b2ccoop@gmail.com.
-          Payment stays self-declared until the Treasurer confirms it. You can complete PMES any time after you sign in.
+          Your login ID (member ID) is <strong>{memberId}</strong>. Firebase Auth sent a password-reset email to the
+          address you used. Payment stays self-declared until the Treasurer confirms it. You can complete PMES any time
+          after you sign in.
         </p>
         <span className="mt-4 inline-flex rounded-full bg-amber-100 px-3 py-1 text-xs font-black uppercase text-amber-900">
           Pending
@@ -449,6 +462,7 @@ export function RegisterApp({ initialPath, onExitToHome }: Props) {
         </div>
       ) : null}
       {step === 4 ? <div className="mt-4"><TurnstileField onToken={setCaptchaToken} /></div> : null}
+      {continueHref ? <ContinueLinkNote href={continueHref} /> : null}
       {error ? <p className="mt-4 text-sm font-bold text-red-700">{error}</p> : null}
       <div className="mt-6 flex gap-3">
         {step > 0 ? (
@@ -467,6 +481,21 @@ export function RegisterApp({ initialPath, onExitToHome }: Props) {
         )}
       </div>
     </Shell>
+  );
+}
+
+function ContinueLinkNote({ href }: { href: string }) {
+  return (
+    <div className="mt-4 rounded-2xl border border-amber-200 bg-amber-50 p-4 text-sm font-medium text-amber-950">
+      <p className="font-black uppercase tracking-wide text-amber-900">Save this continue link</p>
+      <p className="mt-1">
+        Drafts are not emailed. Copy this link now if you will finish on another device. It also stays on this device and
+        in the member portal after you sign in.
+      </p>
+      <a className="mt-2 block break-all font-bold text-[#004aad]" href={href}>
+        {href}
+      </a>
+    </div>
   );
 }
 

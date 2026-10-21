@@ -176,14 +176,10 @@ export async function identityToolkitDeleteUser(projectId: string, localId: stri
   await identityToolkitPost(projectToolkitPath(projectId, "accounts:delete"), { localId: uid });
 }
 
-/** PASSWORD_RESET oob link so we send mail from b2ccoop@gmail.com ourselves. */
-export async function identityToolkitPasswordResetLink(projectId: string, email: string): Promise<string> {
-  const out = await identityToolkitPost(projectToolkitPath(projectId, "accounts:sendOobCode"), {
+/** PASSWORD_RESET via sendOobCode — Firebase Auth sends the email (no returnOobLink). */
+export async function identityToolkitSendPasswordReset(projectId: string, email: string): Promise<void> {
+  await identityToolkitPost(projectToolkitPath(projectId, "accounts:sendOobCode"), {
     requestType: "PASSWORD_RESET",
     email: normalizeEmail(email),
-    returnOobLink: true,
   });
-  const link = String(out.oobLink ?? "");
-  if (!link) throw new Error("Firebase did not return a password-reset link");
-  return link;
 }

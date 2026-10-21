@@ -12,7 +12,7 @@ const firebaseFactory = {
       return {
         lookupByEmail: async () => null,
         signUp: async (email) => ({ localId: `mock-${email}`, email }),
-        passwordResetLink: async () => "https://example.test/reset",
+        sendPasswordResetEmail: async () => undefined,
       };
     }
     return null;

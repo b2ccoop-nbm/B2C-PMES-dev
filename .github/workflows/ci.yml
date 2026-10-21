@@ -55,7 +55,6 @@ jobs:
       DATABASE_URL: postgresql://postgres:postgres@localhost:5432/b2ccoop_webapp
       DIRECT_URL: postgresql://postgres:postgres@localhost:5432/b2ccoop_webapp
       ADMIN_JWT_SECRET: ci-test-jwt-secret-minimum-32-characters-x
-      GMAIL_SENDING_ENABLED: "false"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
