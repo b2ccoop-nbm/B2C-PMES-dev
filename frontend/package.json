@@ -8,6 +8,7 @@
     "dev": "next dev -p 3040",
     "start": "next start -p 3040",
     "lint": "eslint . --max-warnings 0",
+    "test": "vitest run",
     "test:e2e": "playwright test",
     "preflight:api": "bash scripts/preflight-prod-api.sh",
     "cf:build": "opennextjs-cloudflare build",
@@ -42,6 +43,7 @@
   },
   "devDependencies": {
     "@opennextjs/cloudflare": "^1.19.1",
+    "@playwright/test": "^1.56.1",
     "@tailwindcss/vite": "^4.2.2",
     "@types/node": "^22.10.1",
     "@types/react": "^19.0.0",
@@ -54,7 +56,7 @@
     "tailwindcss": "^4.2.2",
     "typescript": "^5.7.2",
     "vite": "^8.0.8",
-    "wrangler": "^4.81.1",
-    "@playwright/test": "^1.56.1"
+    "vitest": "^3.2.4",
+    "wrangler": "^4.81.1"
   }
 }

@@ -170,6 +170,12 @@ export async function identityToolkitSignUp(
   return { localId, email: typeof out.email === "string" ? out.email : email };
 }
 
+export async function identityToolkitDeleteUser(projectId: string, localId: string): Promise<void> {
+  const uid = localId.trim();
+  if (!uid) throw new Error("Firebase UID is required");
+  await identityToolkitPost(projectToolkitPath(projectId, "accounts:delete"), { localId: uid });
+}
+
 /** PASSWORD_RESET oob link so we send mail from b2ccoop@gmail.com ourselves. */
 export async function identityToolkitPasswordResetLink(projectId: string, email: string): Promise<string> {
   const out = await identityToolkitPost(projectToolkitPath(projectId, "accounts:sendOobCode"), {

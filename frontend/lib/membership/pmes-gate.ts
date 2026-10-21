@@ -10,3 +10,16 @@ export function assertPmesPassedForSecretary(
   if (force && superuser) return { ok: true };
   return { ok: false, message: PMES_REQUIRED_MESSAGE };
 }
+
+export function forcePmesOverrideAudit(input: {
+  participantId: string;
+  actorRole: string;
+  force: boolean;
+  pmesPassed: boolean;
+}): { shouldLog: boolean; message: string } {
+  const shouldLog = input.force === true && input.actorRole === "superuser" && !input.pmesPassed;
+  return {
+    shouldLog,
+    message: `Superuser forced secretary/board approval without PMES for participant ${input.participantId}`,
+  };
+}

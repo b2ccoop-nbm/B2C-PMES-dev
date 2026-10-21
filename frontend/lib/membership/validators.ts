@@ -5,6 +5,7 @@ export const DPA_CONSENT_VERSION_DEFAULT = "2026-10-21";
 export const GCASH_REF_DIGITS = 13;
 export const MEMBER_ID_COLLISION_RETRIES = 5;
 export const DRAFT_TTL_DAYS = 60;
+export const RESUME_TOKEN_TTL_DAYS = 30;
 
 export function normalizeEmail(email: string): string {
   return String(email ?? "").trim().toLowerCase();

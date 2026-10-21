@@ -42,7 +42,7 @@ import {
 import { StaffRole, type LoiSubmission, type Participant, type PmesRecord } from "@prisma/client";
 import type { StaffJwtRole } from "../auth/staff-jwt.guard";
 import { BOD_DIRECTOR_SEATS, BOD_MAJORITY_APPROVALS } from "./board-workflow.constants";
-import { assertPmesPassedForSecretary } from "../membership/pmes-gate";
+import { assertPmesPassedForSecretary, forcePmesOverrideAudit } from "../membership/pmes-gate";
 import { derivedApplicationStatus, nextStatusAfterLifecycle } from "../membership/status-sync";
 import { normalizeTinDigits as normalizeTinDigitsMembership, isValidTin } from "../membership/validators";
 
@@ -769,8 +769,14 @@ export class PmesService {
     if (!gate.ok) {
       throw new BadRequestException(gate.message);
     }
-    if (force && actorRole === "superuser" && !passed) {
-      this.logger.warn(`Superuser forced secretary/board approval without PMES for participant ${participantId}`);
+    const audit = forcePmesOverrideAudit({
+      participantId,
+      actorRole,
+      force,
+      pmesPassed: Boolean(passed),
+    });
+    if (audit.shouldLog) {
+      this.logger.warn(audit.message);
     }
   }
 

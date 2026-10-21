@@ -8,18 +8,29 @@ import {
 } from "@/lib/pmes-edge/member-public-id";
 import { blockingFinding, evaluateDuplicates, firstFlaggedParticipantId, type DuplicateLookup } from "@/lib/membership/duplicate-engine";
 import { approvedEmail, rejectedEmail, resumeEmail, setPasswordEmail, treasurerPromptEmail } from "@/lib/membership/email-templates";
-import { createFirebaseMemberAccount } from "@/lib/membership/firebase-signup";
+import { publicCreateForExistingApplication } from "@/lib/membership/existing-draft-policy";
+import { createFirebaseMemberAccount, deleteFirebaseMemberAccount } from "@/lib/membership/firebase-signup";
 import { sendMembershipEmail } from "@/lib/membership/mailer";
 import { draftIpWindow, isRateLimited, lookupIpWindow, submitEmailWindow } from "@/lib/membership/rate-limit";
+import { referrerConflictMessage } from "@/lib/membership/referrer-rules";
 import { derivedApplicationStatus, nextStatusAfterLifecycle } from "@/lib/membership/status-sync";
-import { generateResumeToken, hashResumeToken } from "@/lib/membership/tokens";
+import {
+  continueUrl,
+  generateResumeToken,
+  hashResumeToken,
+  isResumeTokenExpired,
+  resumeTokenExpiresAt,
+  tokensMatch,
+} from "@/lib/membership/tokens";
 import { verifyTurnstile } from "@/lib/membership/turnstile";
+import { isUniqueViolation } from "@/lib/membership/unique-violation";
 import {
   composeFullName,
   DPA_CONSENT_VERSION_DEFAULT,
   DRAFT_TTL_DAYS,
   formatDobIso,
   formatMailingAddress,
+  isValidEmail,
   MEMBER_ID_COLLISION_RETRIES,
   MEMBERSHIP_FEE_DEFAULT,
   MIN_SHARE_CAPITAL,
@@ -40,6 +51,9 @@ export type ApplicationRow = {
   id: string;
   status: string;
   resumeTokenHash: string;
+  resumeTokenExpiresAt?: string | Date | null;
+  pendingResumeTokenHash?: string | null;
+  pendingResumeTokenExpiresAt?: string | Date | null;
   participantId: string | null;
   fullName: string | null;
   firstName: string | null;
@@ -135,7 +149,7 @@ async function loadByToken(sql: Sql, id: string, token: string) {
   const rows = await sql`SELECT * FROM "MembershipApplication" WHERE id = ${id} LIMIT 1`;
   const row = (rows as ApplicationRow[])[0];
   if (!row) return { error: jsonError("Application not found", 404) };
-  if ((await hashResumeToken(token)) !== row.resumeTokenHash) {
+  if (!(await tokensMatch(token, row.resumeTokenHash)) || isResumeTokenExpired(row.resumeTokenExpiresAt)) {
     return { error: jsonError("Resume token is invalid.", 401) };
   }
   return { row };
@@ -198,29 +212,45 @@ function duplicateLookup(sql: Sql): DuplicateLookup {
   };
 }
 
-export async function resolveApprovedReferrer(sql: Sql, raw: string): Promise<string | null> {
+export async function resolveApprovedReferrer(
+  sql: Sql,
+  raw: string,
+  applicant?: { email?: string | null; mobile?: string | null; participantId?: string | null },
+): Promise<string | null> {
   const q = String(raw ?? "").trim();
   if (!q) return null;
+  let candidate: { id: string; email?: string | null; phone?: string | null; boardApprovedAt: string | Date | null } | null = null;
   const pioneer = q.match(/^PIONEER-([a-fA-F0-9]{8})$/i);
   if (pioneer?.[1]) {
     const suffix = pioneer[1].toUpperCase();
     const rows = await sql`
-      SELECT id, "boardApprovedAt" FROM "Participant"
+      SELECT id, "boardApprovedAt", email, phone FROM "Participant"
       WHERE "firebaseUid" IS NOT NULL
         AND UPPER(RIGHT(REPLACE("firebaseUid", '-', ''), 8)) = ${suffix}
       LIMIT 2
     `;
-    const list = rows as { id: string; boardApprovedAt: string | Date | null }[];
-    if (list.length === 1 && list[0]!.boardApprovedAt) return list[0]!.id;
-    return null;
+    const list = rows as { id: string; boardApprovedAt: string | Date | null; email: string; phone: string | null }[];
+    if (list.length === 1 && list[0]!.boardApprovedAt) candidate = list[0]!;
+  } else {
+    const rows = await sql`
+      SELECT id, email, phone, "boardApprovedAt" FROM "Participant"
+      WHERE "boardApprovedAt" IS NOT NULL
+        AND (id = ${q} OR "memberIdNo" = ${q} OR callsign = ${q.toLowerCase()})
+      LIMIT 1
+    `;
+    candidate = (rows as { id: string; email: string; phone: string | null; boardApprovedAt: string | Date | null }[])[0] ?? null;
   }
-  const rows = await sql`
-    SELECT id FROM "Participant"
-    WHERE "boardApprovedAt" IS NOT NULL
-      AND (id = ${q} OR "memberIdNo" = ${q} OR callsign = ${q.toLowerCase()})
-    LIMIT 1
-  `;
-  return (rows as { id: string }[])[0]?.id ?? null;
+  if (!candidate) return null;
+  const conflict = referrerConflictMessage({
+    referrerId: candidate.id,
+    referrerEmail: candidate.email,
+    referrerPhone: candidate.phone,
+    applicantEmail: applicant?.email,
+    applicantMobile: applicant?.mobile,
+    applicantParticipantId: applicant?.participantId,
+  });
+  if (conflict) throw new Error(conflict);
+  return candidate.id;
 }
 
 async function allocateMemberId(sql: Sql, fullName: string, firstName: string | null, lastName: string | null, dobIso: string) {
@@ -232,6 +262,28 @@ async function allocateMemberId(sql: Sql, fullName: string, firstName: string | 
     if ((clash as { id: string }[]).length === 0) return id;
   }
   throw new Error(`Could not allocate a unique member ID after ${MEMBER_ID_COLLISION_RETRIES} retries.`);
+}
+
+async function allocateMemberIdWithRetry(
+  sql: Sql,
+  fullName: string,
+  firstName: string | null,
+  lastName: string | null,
+  dobIso: string,
+  write: (memberIdNo: string) => Promise<void>,
+) {
+  let last: unknown;
+  for (let i = 0; i < MEMBER_ID_COLLISION_RETRIES; i++) {
+    const memberIdNo = await allocateMemberId(sql, fullName, firstName, lastName, dobIso);
+    try {
+      await write(memberIdNo);
+      return memberIdNo;
+    } catch (e) {
+      last = e;
+      if (!isUniqueViolation(e)) throw e;
+    }
+  }
+  throw last instanceof Error ? last : new Error(`Could not allocate a unique member ID after ${MEMBER_ID_COLLISION_RETRIES} retries.`);
 }
 
 async function notifyTreasurers(sql: Sql, row: ApplicationRow, memberIdNo?: string | null) {
@@ -274,6 +326,7 @@ export async function createDraft(input: {
   if (limited) return limited;
   if (!input.dpaConsent) return jsonError("Data Privacy Act consent is required.", 400);
   const email = normalizeEmail(input.email);
+  if (!isValidEmail(email)) return jsonError("email is required", 400);
   const mobile = input.mobile ? normalizePhMobile(input.mobile) : null;
   const existing = await sql`
     SELECT * FROM "MembershipApplication"
@@ -281,29 +334,47 @@ export async function createDraft(input: {
     LIMIT 1
   `;
   const open = (existing as ApplicationRow[])[0];
+  if (open) {
+    const policy = publicCreateForExistingApplication(open.status);
+    if (policy.emailContinue) {
+      const pending = await generateResumeToken();
+      const pendingHash = await hashResumeToken(pending);
+      const pendingExp = resumeTokenExpiresAt();
+      await sql`
+        UPDATE "MembershipApplication"
+        SET "pendingResumeTokenHash" = ${pendingHash}, "pendingResumeTokenExpiresAt" = ${pendingExp}, "updatedAt" = NOW()
+        WHERE id = ${open.id}
+      `;
+      await sendMembershipEmail(resumeEmail({ to: email, continueUrl: continueUrl(publicAppUrl(), pending) })).catch(() => undefined);
+    }
+    return { ok: true as const, status: 200, body: { checkEmail: true, message: policy.message } };
+  }
+  let referrer: string | null = null;
+  if (input.referralCode) {
+    try {
+      referrer = await resolveApprovedReferrer(sql, input.referralCode, { email, mobile });
+    } catch (e) {
+      return jsonError(e instanceof Error ? e.message : "Referred by must be an approved member.", 400);
+    }
+  }
   const token = await generateResumeToken();
   const hash = await hashResumeToken(token);
-  if (open) {
-    await sql`UPDATE "MembershipApplication" SET "resumeTokenHash" = ${hash}, "updatedAt" = NOW() WHERE id = ${open.id}`;
-    await sendMembershipEmail(resumeEmail({ to: email, continueUrl: `${publicAppUrl()}/register/continue?t=${encodeURIComponent(token)}` })).catch(() => undefined);
-    return { ok: true as const, status: 200, body: { ...toPublicApplication(open), resumeToken: token, resumed: true } };
-  }
-  const referrer = input.referralCode ? await resolveApprovedReferrer(sql, input.referralCode) : null;
+  const expires = resumeTokenExpiresAt();
   const id = crypto.randomUUID();
   const created = await sql`
     INSERT INTO "MembershipApplication" (
-      id, status, "resumeTokenHash", email, mobile, "dpaConsentAt", "dpaConsentVersion",
+      id, status, "resumeTokenHash", "resumeTokenExpiresAt", email, mobile, "dpaConsentAt", "dpaConsentVersion",
       "consentIp", "userAgent", "referredByParticipantId", "shareCapitalAmount", "membershipFeeAmount",
       "createdAt", "updatedAt"
     ) VALUES (
-      ${id}, 'DRAFT', ${hash}, ${email}, ${mobile}, NOW(), ${process.env.DPA_CONSENT_VERSION?.trim() || DPA_CONSENT_VERSION_DEFAULT},
+      ${id}, 'DRAFT', ${hash}, ${expires}, ${email}, ${mobile}, NOW(), ${process.env.DPA_CONSENT_VERSION?.trim() || DPA_CONSENT_VERSION_DEFAULT},
       ${input.ip.slice(0, 64)}, ${(input.userAgent ?? "").slice(0, 500)}, ${referrer},
       ${MIN_SHARE_CAPITAL}, ${MEMBERSHIP_FEE_DEFAULT}, NOW(), NOW()
     )
     RETURNING *
   `;
   const row = (created as ApplicationRow[])[0]!;
-  await sendMembershipEmail(resumeEmail({ to: email, continueUrl: `${publicAppUrl()}/register/continue?t=${encodeURIComponent(token)}` })).catch(() => undefined);
+  await sendMembershipEmail(resumeEmail({ to: email, continueUrl: continueUrl(publicAppUrl(), token) })).catch(() => undefined);
   return { ok: true as const, status: 201, body: { ...toPublicApplication(row), resumeToken: token, resumed: false } };
 }
 
@@ -348,12 +419,30 @@ export async function patchDraft(id: string, token: string, fields: Record<strin
   if (fields.tinNo !== undefined) tinNo = fields.tinNo ? normalizeTinDigits(String(fields.tinNo)) || null : null;
   if (fields.residentialAddress !== undefined) address = fields.residentialAddress;
   if (fields.referredByParticipantId !== undefined) {
-    referredBy = fields.referredByParticipantId ? await resolveApprovedReferrer(sql, String(fields.referredByParticipantId)) : null;
+    try {
+      referredBy = fields.referredByParticipantId
+        ? await resolveApprovedReferrer(sql, String(fields.referredByParticipantId), {
+            email: row.email,
+            mobile: row.mobile,
+            participantId: row.participantId,
+          })
+        : null;
+    } catch (e) {
+      return jsonError(e instanceof Error ? e.message : "Referred by must be an approved member.", 400);
+    }
     if (fields.referredByParticipantId && !referredBy) return jsonError("Referred by must be an approved member.", 400);
   }
   if (fields.referralQuery) {
-    const resolved = await resolveApprovedReferrer(sql, String(fields.referralQuery));
-    if (resolved) referredBy = resolved;
+    try {
+      const resolved = await resolveApprovedReferrer(sql, String(fields.referralQuery), {
+        email: row.email,
+        mobile: row.mobile,
+        participantId: row.participantId,
+      });
+      if (resolved) referredBy = resolved;
+    } catch (e) {
+      return jsonError(e instanceof Error ? e.message : "Referred by must be an approved member.", 400);
+    }
   }
   if (fields.shareCapitalAmount !== undefined) {
     const n = validateShareCapital(fields.shareCapitalAmount);
@@ -439,8 +528,16 @@ export async function submitDraft(id: string, token: string, input: { captchaTok
   });
   if (issues.length) return jsonError("Please fix the highlighted fields.", 400, { issues });
   if (row.referredByParticipantId) {
-    const ok = await resolveApprovedReferrer(sql, row.referredByParticipantId);
-    if (!ok) return jsonError("Referred by must be an approved member.", 400);
+    try {
+      const ok = await resolveApprovedReferrer(sql, row.referredByParticipantId, {
+        email: row.email,
+        mobile: row.mobile,
+        participantId: row.participantId,
+      });
+      if (!ok) return jsonError("Referred by must be an approved member.", 400);
+    } catch (e) {
+      return jsonError(e instanceof Error ? e.message : "Referred by must be an approved member.", 400);
+    }
   }
 
   const dups = await evaluateDuplicates(
@@ -460,6 +557,70 @@ export async function submitDraft(id: string, token: string, input: { captchaTok
   const tin = row.tinNo ? normalizeTinDigits(row.tinNo) : null;
   const mailing = formatMailingAddress(row.residentialAddress as never);
 
+  const existing = await sql`SELECT id, "memberIdNo", "referredByParticipantId", "registrationSource", "firebaseUid" FROM "Participant" WHERE email = ${row.email} LIMIT 1`;
+  const existingRow = (existing as { id: string; memberIdNo: string | null; referredByParticipantId: string | null; registrationSource: string | null; firebaseUid: string | null }[])[0];
+  const participantId = existingRow?.id ?? crypto.randomUUID();
+  const tinFlag = tin ? null : new Date();
+
+  let memberIdNo = existingRow?.memberIdNo ?? "";
+  const writeParticipant = async (allocated: string) => {
+    memberIdNo = existingRow?.memberIdNo || allocated;
+    if (existingRow) {
+      await sql`
+        UPDATE "Participant" SET
+          "fullName" = ${fullName},
+          phone = ${mobile},
+          dob = ${dobIso},
+          gender = ${String(row.gender ?? "").trim()},
+          "tinNo" = ${tin},
+          "mailingAddress" = ${mailing || null},
+          "memberIdNo" = ${memberIdNo},
+          "referredByParticipantId" = COALESCE("referredByParticipantId", ${row.referredByParticipantId}),
+          "tinMissingFlaggedAt" = ${tinFlag},
+          "registrationSource" = COALESCE("registrationSource", 'online_form')
+        WHERE id = ${existingRow.id}
+      `;
+    } else {
+      await sql`
+        INSERT INTO "Participant" (
+          id, "fullName", email, phone, dob, gender, "tinNo", "mailingAddress",
+          "memberIdNo", "referredByParticipantId", "tinMissingFlaggedAt", "registrationSource"
+        ) VALUES (
+          ${participantId}, ${fullName}, ${row.email}, ${mobile}, ${dobIso}, ${String(row.gender ?? "").trim()},
+          ${tin}, ${mailing || null}, ${memberIdNo}, ${row.referredByParticipantId},
+          ${tinFlag}, 'online_form'
+        )
+      `;
+    }
+  };
+  try {
+    if (existingRow?.memberIdNo) {
+      await writeParticipant(existingRow.memberIdNo);
+    } else {
+      await allocateMemberIdWithRetry(sql, fullName, row.firstName, row.lastName, dobIso, writeParticipant);
+    }
+  } catch (e) {
+    return jsonError(e instanceof Error ? e.message : "Could not create participant", 400);
+  }
+
+  const newToken = await generateResumeToken();
+  const newHash = await hashResumeToken(newToken);
+  const newExp = resumeTokenExpiresAt();
+  const updated = await sql`
+    UPDATE "MembershipApplication" SET
+      status = 'SUBMITTED',
+      "participantId" = ${existingRow?.id ?? participantId},
+      "fullName" = ${fullName},
+      "submittedAt" = NOW(),
+      "resumeTokenHash" = ${newHash},
+      "resumeTokenExpiresAt" = ${newExp},
+      "possibleDuplicateOfId" = ${firstFlaggedParticipantId(dups)},
+      "updatedAt" = NOW()
+    WHERE id = ${row.id}
+    RETURNING *
+  `;
+  const next = (updated as ApplicationRow[])[0]!;
+
   let firebase;
   try {
     firebase = await createFirebaseMemberAccount(row.email, fullName);
@@ -468,62 +629,20 @@ export async function submitDraft(id: string, token: string, input: { captchaTok
   }
 
   const otherUid = await sql`
-    SELECT id FROM "Participant" WHERE "firebaseUid" = ${firebase.uid} AND email <> ${row.email} LIMIT 1
+    SELECT id FROM "Participant" WHERE "firebaseUid" = ${firebase.uid} AND id <> ${existingRow?.id ?? participantId} LIMIT 1
   `;
   if ((otherUid as { id: string }[]).length) {
+    if (firebase.created) await deleteFirebaseMemberAccount(firebase.uid).catch(() => undefined);
     return jsonError("Already registered — sign in or reset password", 409);
   }
 
-  const existing = await sql`SELECT id, "memberIdNo", "referredByParticipantId", "registrationSource" FROM "Participant" WHERE email = ${row.email} LIMIT 1`;
-  const existingRow = (existing as { id: string; memberIdNo: string | null; referredByParticipantId: string | null; registrationSource: string | null }[])[0];
-  const memberIdNo = existingRow?.memberIdNo || (await allocateMemberId(sql, fullName, row.firstName, row.lastName, dobIso));
-  const participantId = existingRow?.id ?? crypto.randomUUID();
-  const tinFlag = tin ? null : new Date();
-
-  if (existingRow) {
-    await sql`
-      UPDATE "Participant" SET
-        "fullName" = ${fullName},
-        phone = ${mobile},
-        dob = ${dobIso},
-        gender = ${String(row.gender ?? "").trim()},
-        "tinNo" = ${tin},
-        "mailingAddress" = ${mailing || null},
-        "firebaseUid" = ${firebase.uid},
-        "memberIdNo" = ${memberIdNo},
-        "referredByParticipantId" = COALESCE("referredByParticipantId", ${row.referredByParticipantId}),
-        "tinMissingFlaggedAt" = ${tinFlag},
-        "registrationSource" = COALESCE("registrationSource", 'online_form')
-      WHERE id = ${existingRow.id}
-    `;
-  } else {
-    await sql`
-      INSERT INTO "Participant" (
-        id, "fullName", email, phone, dob, gender, "tinNo", "mailingAddress", "firebaseUid",
-        "memberIdNo", "referredByParticipantId", "tinMissingFlaggedAt", "registrationSource"
-      ) VALUES (
-        ${participantId}, ${fullName}, ${row.email}, ${mobile}, ${dobIso}, ${String(row.gender ?? "").trim()},
-        ${tin}, ${mailing || null}, ${firebase.uid}, ${memberIdNo}, ${row.referredByParticipantId},
-        ${tinFlag}, 'online_form'
-      )
-    `;
+  try {
+    await sql`UPDATE "Participant" SET "firebaseUid" = ${firebase.uid} WHERE id = ${existingRow?.id ?? participantId}`;
+  } catch (e) {
+    if (firebase.created) await deleteFirebaseMemberAccount(firebase.uid).catch(() => undefined);
+    return jsonError(e instanceof Error ? e.message : "Could not link Firebase login", 400);
   }
 
-  const newToken = await generateResumeToken();
-  const newHash = await hashResumeToken(newToken);
-  const updated = await sql`
-    UPDATE "MembershipApplication" SET
-      status = 'SUBMITTED',
-      "participantId" = ${existingRow?.id ?? participantId},
-      "fullName" = ${fullName},
-      "submittedAt" = NOW(),
-      "resumeTokenHash" = ${newHash},
-      "possibleDuplicateOfId" = ${firstFlaggedParticipantId(dups)},
-      "updatedAt" = NOW()
-    WHERE id = ${row.id}
-    RETURNING *
-  `;
-  const next = (updated as ApplicationRow[])[0]!;
   await sendMembershipEmail(
     setPasswordEmail({
       to: row.email,
@@ -551,35 +670,80 @@ export async function resendResume(id: string, token: string) {
   const sql = getSql();
   const loaded = await loadByToken(sql, id, token);
   if (loaded.error) return loaded.error;
-  const next = await generateResumeToken();
-  await sql`UPDATE "MembershipApplication" SET "resumeTokenHash" = ${await hashResumeToken(next)}, "updatedAt" = NOW() WHERE id = ${id}`;
+  const pending = await generateResumeToken();
+  const pendingHash = await hashResumeToken(pending);
+  const pendingExp = resumeTokenExpiresAt();
+  await sql`
+    UPDATE "MembershipApplication"
+    SET "pendingResumeTokenHash" = ${pendingHash}, "pendingResumeTokenExpiresAt" = ${pendingExp}, "updatedAt" = NOW()
+    WHERE id = ${id}
+  `;
   await sendMembershipEmail(
-    resumeEmail({ to: loaded.row.email, continueUrl: `${publicAppUrl()}/register/continue?t=${encodeURIComponent(next)}` }),
+    resumeEmail({ to: loaded.row.email, continueUrl: continueUrl(publicAppUrl(), pending) }),
   ).catch(() => undefined);
-  return { ok: true as const, status: 200, body: { ok: true, resumeToken: next } };
+  return { ok: true as const, status: 200, body: { ok: true, emailed: true } };
 }
 
-export async function lookupReferrer(q: string, ip: string) {
+export async function claimResume(token: string) {
+  const plain = String(token ?? "").trim();
+  if (!plain) return jsonError("Resume token is required.", 401);
+  const hash = await hashResumeToken(plain);
+  const sql = getSql();
+  const live = await sql`SELECT * FROM "MembershipApplication" WHERE "resumeTokenHash" = ${hash} LIMIT 1`;
+  const liveRow = (live as ApplicationRow[])[0];
+  if (liveRow) {
+    if (isResumeTokenExpired(liveRow.resumeTokenExpiresAt)) {
+      return jsonError("This continue link is invalid or expired.", 401);
+    }
+    return { ok: true as const, status: 200, body: { ...toPublicApplication(liveRow), resumeToken: plain } };
+  }
+  const pending = await sql`SELECT * FROM "MembershipApplication" WHERE "pendingResumeTokenHash" = ${hash} LIMIT 1`;
+  const pendingRow = (pending as ApplicationRow[])[0];
+  if (!pendingRow || isResumeTokenExpired(pendingRow.pendingResumeTokenExpiresAt)) {
+    return jsonError("This continue link is invalid or expired.", 401);
+  }
+  const next = await generateResumeToken();
+  const nextHash = await hashResumeToken(next);
+  const nextExp = resumeTokenExpiresAt();
+  const updated = await sql`
+    UPDATE "MembershipApplication"
+    SET "resumeTokenHash" = ${nextHash}, "resumeTokenExpiresAt" = ${nextExp},
+        "pendingResumeTokenHash" = NULL, "pendingResumeTokenExpiresAt" = NULL, "updatedAt" = NOW()
+    WHERE id = ${pendingRow.id}
+    RETURNING *
+  `;
+  return { ok: true as const, status: 200, body: { ...toPublicApplication((updated as ApplicationRow[])[0]!), resumeToken: next } };
+}
+
+export async function lookupReferrer(
+  q: string,
+  ip: string,
+  applicant?: { email?: string | null; mobile?: string | null; participantId?: string | null },
+) {
   const sql = getSql();
   const limited = await consumeRate(sql, lookupIpWindow(ip));
   if (limited) return limited;
   const query = String(q ?? "").trim();
   if (query.length < 2) return { ok: true as const, status: 200, body: { results: [] } };
-  const resolved = await resolveApprovedReferrer(sql, query);
-  if (resolved) {
-    const rows = await sql`SELECT "memberIdNo", "fullName" FROM "Participant" WHERE id = ${resolved} LIMIT 1`;
-    const p = (rows as { memberIdNo: string | null; fullName: string }[])[0];
-    if (p?.memberIdNo) {
-      return { ok: true as const, status: 200, body: { results: [{ memberIdNo: p.memberIdNo, displayName: maskName(p.fullName), participantId: resolved }] } };
+  try {
+    const resolved = await resolveApprovedReferrer(sql, query, applicant);
+    if (resolved) {
+      const rows = await sql`SELECT "memberIdNo", "fullName" FROM "Participant" WHERE id = ${resolved} LIMIT 1`;
+      const p = (rows as { memberIdNo: string | null; fullName: string }[])[0];
+      if (p?.memberIdNo) {
+        return { ok: true as const, status: 200, body: { results: [{ memberIdNo: p.memberIdNo, displayName: maskName(p.fullName) }] } };
+      }
     }
+  } catch (e) {
+    return jsonError(e instanceof Error ? e.message : "Referred by must be an approved member.", 400);
   }
   const rows = await sql`
-    SELECT id, "memberIdNo", "fullName" FROM "Participant"
+    SELECT id, "memberIdNo", "fullName", email, phone FROM "Participant"
     WHERE "boardApprovedAt" IS NOT NULL
       AND (
-        "fullName" ILIKE ${`%${query}%`}
-        OR "memberIdNo" ILIKE ${`%${query}%`}
-        OR callsign ILIKE ${`%${query.toLowerCase()}%`}
+        "fullName" ILIKE ${`%${query.replace(/[%_]/g, "\\$&")}%`}
+        OR "memberIdNo" ILIKE ${`%${query.replace(/[%_]/g, "\\$&")}%`}
+        OR callsign ILIKE ${`%${query.toLowerCase().replace(/[%_]/g, "\\$&")}%`}
       )
     LIMIT 8
   `;
@@ -587,9 +751,17 @@ export async function lookupReferrer(q: string, ip: string) {
     ok: true as const,
     status: 200,
     body: {
-      results: (rows as { id: string; memberIdNo: string | null; fullName: string }[])
+      results: (rows as { id: string; memberIdNo: string | null; fullName: string; email: string; phone: string | null }[])
         .filter((r) => r.memberIdNo)
-        .map((r) => ({ memberIdNo: r.memberIdNo as string, displayName: maskName(r.fullName), participantId: r.id })),
+        .filter((r) => !referrerConflictMessage({
+          referrerId: r.id,
+          referrerEmail: r.email,
+          referrerPhone: r.phone,
+          applicantEmail: applicant?.email,
+          applicantMobile: applicant?.mobile,
+          applicantParticipantId: applicant?.participantId,
+        }))
+        .map((r) => ({ memberIdNo: r.memberIdNo as string, displayName: maskName(r.fullName) })),
     },
   };
 }
@@ -620,7 +792,7 @@ export async function runMembershipCron() {
   `;
   const stale = await sql`
     SELECT id FROM "MembershipApplication"
-    WHERE status = 'EXPIRED' AND "updatedAt" < ${cutoff}
+    WHERE status = 'EXPIRED' AND "createdAt" < ${cutoff}
     LIMIT 200
   `;
   const ids = (stale as { id: string }[]).map((r) => r.id);
@@ -744,7 +916,18 @@ export async function adminPatchReferrer(id: string, staff: { role: string }, re
   const row = (rows as ApplicationRow[])[0];
   if (!row) return jsonError("Application not found", 404);
   if (row.status === "APPROVED") return jsonError("Referrer can only be corrected before approval.", 400);
-  const resolved = referrerId ? await resolveApprovedReferrer(sql, referrerId) : null;
+  let resolved: string | null = null;
+  try {
+    resolved = referrerId
+      ? await resolveApprovedReferrer(sql, referrerId, {
+          email: row.email,
+          mobile: row.mobile,
+          participantId: row.participantId,
+        })
+      : null;
+  } catch (e) {
+    return jsonError(e instanceof Error ? e.message : "Referred by must be an approved member.", 400);
+  }
   if (referrerId && !resolved) return jsonError("Referred by must be an approved member.", 400);
   const updated = await sql`
     UPDATE "MembershipApplication" SET "referredByParticipantId" = ${resolved}, "updatedAt" = NOW()

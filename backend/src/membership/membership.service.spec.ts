@@ -1,4 +1,4 @@
-import { BadRequestException, ConflictException } from "@nestjs/common";
+import { BadRequestException, ConflictException, UnauthorizedException } from "@nestjs/common";
 import { MembershipApplicationStatus } from "@prisma/client";
 import { MembershipService } from "./membership.service";
 import { hashResumeToken } from "./tokens";
@@ -45,6 +45,9 @@ function draftRow(overrides: Record<string, unknown> = {}) {
     receiptNo: null,
     rejectedAt: null,
     rejectionReason: null,
+    resumeTokenExpiresAt: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
+    pendingResumeTokenHash: null,
+    pendingResumeTokenExpiresAt: null,
     createdAt: new Date(),
     updatedAt: new Date(),
     ...overrides,
@@ -96,6 +99,7 @@ function firebasePort() {
     lookupByEmail: jest.fn().mockResolvedValue(null),
     signUp: jest.fn().mockResolvedValue({ localId: "fb-uid-1", email: "juan@example.com" }),
     passwordResetLink: jest.fn().mockResolvedValue("https://example.test/reset?oob=1"),
+    deleteUser: jest.fn().mockResolvedValue(undefined),
   };
 }
 
@@ -108,8 +112,9 @@ function serviceFor(row: ReturnType<typeof draftRow>, extras: Record<string, unk
 }
 
 describe("MembershipService", () => {
-  it("creates a draft and resumes an open application", async () => {
+  it("does not rotate a token or return PII when the email already has an application", async () => {
     const open = draftRow();
+    const priorHash = open.resumeTokenHash;
     const { service, prisma } = serviceFor(open);
     prisma.membershipApplication.findFirst.mockResolvedValueOnce(open);
     const out = await service.createDraft({
@@ -117,8 +122,26 @@ describe("MembershipService", () => {
       dpaConsent: true,
       ip: "1.1.1.1",
     });
-    expect(out.resumed).toBe(true);
-    expect(out.resumeToken).toBeTruthy();
+    expect(out).toEqual({ checkEmail: true, message: "Check your email to continue." });
+    expect(out).not.toHaveProperty("resumeToken");
+    expect(out).not.toHaveProperty("tinNo");
+    const update = prisma.membershipApplication.update.mock.calls[0][0];
+    expect(update.data.resumeTokenHash).toBeUndefined();
+    expect(update.data.pendingResumeTokenHash).toBeTruthy();
+    expect(update.data.pendingResumeTokenHash).not.toBe(priorHash);
+  });
+
+  it("does not treat a submitted application as publicly resumable", async () => {
+    const open = draftRow({ status: MembershipApplicationStatus.SUBMITTED });
+    const { service, prisma } = serviceFor(open);
+    prisma.membershipApplication.findFirst.mockResolvedValueOnce(open);
+    const out = await service.createDraft({
+      email: "juan@example.com",
+      dpaConsent: true,
+      ip: "1.1.1.1",
+    });
+    expect(out.checkEmail).toBe(true);
+    expect(prisma.membershipApplication.update).not.toHaveBeenCalled();
   });
 
   it("allows submit before paying (cash unpaid)", async () => {
@@ -196,11 +219,68 @@ describe("MembershipService", () => {
     expect(prisma.staffUser.findMany).toHaveBeenCalled();
   });
 
-  it("expires drafts older than 60 days", async () => {
+  it("expires drafts older than 60 days and purges by createdAt in the same run", async () => {
     const { service, prisma } = serviceFor(draftRow());
     const out = await service.expireDrafts();
     expect(out.expired).toBe(1);
     expect(prisma.membershipApplication.updateMany).toHaveBeenCalled();
+    const findMany = prisma.membershipApplication.findMany.mock.calls.find((c: [{ where?: { createdAt?: unknown; updatedAt?: unknown } }]) =>
+      c[0]?.where && "createdAt" in (c[0].where as object),
+    );
+    expect(findMany?.[0].where.createdAt).toBeTruthy();
+    expect(findMany?.[0].where.updatedAt).toBeUndefined();
+  });
+
+  it("rejects an expired resume token", async () => {
+    const row = draftRow({ resumeTokenExpiresAt: new Date(Date.now() - 1000) });
+    const { service } = serviceFor(row);
+    await expect(service.getDraft(row.id, "resume-token-plain")).rejects.toBeInstanceOf(UnauthorizedException);
+  });
+
+  it("stores a server-generated screenshot key after magic-byte checks", async () => {
+    const row = draftRow();
+    const { service, prisma } = serviceFor(row);
+    const jpeg = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46, 0x00, 0x01]);
+    const out = await service.attachScreenshot(row.id, "resume-token-plain", jpeg);
+    expect(out.hasGcashScreenshot).toBe(true);
+    const key = prisma.membershipApplication.update.mock.calls[0][0].data.gcashScreenshotKey as string;
+    expect(key).toMatch(/^mock:membership\/app-1\//);
+  });
+
+  it("rejects a self or same-email referrer", async () => {
+    const row = draftRow({ email: "juan@example.com" });
+    const { service, prisma } = serviceFor(row);
+    prisma.participant.findFirst.mockResolvedValue({
+      id: "ref-self",
+      email: "juan@example.com",
+      phone: "+639171234567",
+      boardApprovedAt: new Date(),
+    });
+    await expect(
+      service.patchDraft(row.id, "resume-token-plain", { referredByParticipantId: "ref-self" }),
+    ).rejects.toBeInstanceOf(BadRequestException);
+  });
+
+  it("creates Firebase after the participant write and compensates on link failure", async () => {
+    const row = draftRow();
+    const { service, prisma, firebase } = serviceFor(row);
+    const order: string[] = [];
+    prisma.$transaction.mockImplementation(async (fn: (tx: unknown) => Promise<unknown>) => {
+      order.push("db");
+      return fn(prisma);
+    });
+    firebase.signUp.mockImplementation(async () => {
+      order.push("firebase");
+      return { localId: "fb-uid-1", email: row.email };
+    });
+    prisma.participant.update.mockImplementation(async () => {
+      order.push("link");
+      throw new Error("link failed");
+    });
+    await expect(service.submit(row.id, "resume-token-plain", { ip: "1.1.1.1" })).rejects.toThrow(/link failed/);
+    expect(order[0]).toBe("db");
+    expect(order).toContain("firebase");
+    expect(firebase.deleteUser).toHaveBeenCalledWith("fb-uid-1");
   });
 
   it("rate-limits extra drafts from one IP", async () => {

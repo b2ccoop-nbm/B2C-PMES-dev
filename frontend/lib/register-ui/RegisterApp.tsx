@@ -10,10 +10,12 @@ import {
   patchApplication,
   readResume,
   resumeByToken,
+  resumeFromCookie,
   submitApplication,
   uploadScreenshot,
   type RegisterApplication,
 } from "./registerApi";
+import { TurnstileField } from "./TurnstileField";
 
 const STEPS = ["Personal", "Contact", "Referral", "Payments", "Review"] as const;
 
@@ -31,7 +33,9 @@ export function RegisterApp({ initialPath, onExitToHome }: Props) {
   const [app, setApp] = useState<RegisterApplication | null>(null);
   const [token, setToken] = useState<string | null>(null);
   const [memberId, setMemberId] = useState<string | null>(null);
-  const [referrerHits, setReferrerHits] = useState<{ memberIdNo: string; displayName: string; participantId: string }[]>([]);
+  const [referrerHits, setReferrerHits] = useState<{ memberIdNo: string; displayName: string; participantId?: string }[]>([]);
+  const [captchaToken, setCaptchaToken] = useState("");
+  const [checkEmail, setCheckEmail] = useState<string | null>(null);
   const [form, setForm] = useState({
     email: "",
     mobile: "",
@@ -64,11 +68,14 @@ export function RegisterApp({ initialPath, onExitToHome }: Props) {
     const params = new URLSearchParams(window.location.search);
     const ref = params.get("ref")?.trim();
     if (ref) setForm((f) => ({ ...f, referralQuery: ref }));
-    const t = params.get("t")?.trim();
-    if (t) {
-      void resumeByToken(t)
+    const hash = window.location.hash || "";
+    const claim = hash.match(/(?:^|#|&)c=([^&]+)/)?.[1];
+    if (claim) {
+      const token = decodeURIComponent(claim);
+      window.history.replaceState({}, "", window.location.pathname);
+      void resumeByToken(token)
         .then((row) => {
-          applyRow(row, row.resumeToken || t);
+          applyRow(row, row.resumeToken || token);
         })
         .catch((e) => setError(e instanceof Error ? e.message : "Could not resume"));
       return;
@@ -78,7 +85,13 @@ export function RegisterApp({ initialPath, onExitToHome }: Props) {
       void loadApplication(stored.id, stored.token)
         .then((row) => applyRow(row, stored.token!))
         .catch(() => undefined);
+      return;
     }
+    void resumeFromCookie()
+      .then((row) => {
+        if (row?.id) applyRow(row, row.resumeToken || stored.token || "");
+      })
+      .catch(() => undefined);
   }, []);
 
   function applyRow(row: RegisterApplication, resume: string) {
@@ -170,8 +183,13 @@ export function RegisterApp({ initialPath, onExitToHome }: Props) {
         email: form.email,
         mobile: form.mobile,
         dpaConsent: form.dpaConsent,
+        captchaToken: captchaToken || undefined,
         referralCode: form.referralQuery || undefined,
       });
+      if (row.checkEmail) {
+        setCheckEmail(row.message || "Check your email to continue.");
+        return;
+      }
       applyRow(row, row.resumeToken || readResume(row.id).token || "");
       setStep(0);
     } catch (err) {
@@ -209,7 +227,7 @@ export function RegisterApp({ initialPath, onExitToHome }: Props) {
         paymentMode: form.paymentMode || null,
         gcashRefNo: form.gcashRefNo,
       });
-      const out = await submitApplication(app.id, token);
+      const out = await submitApplication(app.id, token, captchaToken || undefined);
       setMemberId(out.memberIdNo);
       if (typeof window !== "undefined") {
         window.history.replaceState({}, "", "/register/done");
@@ -291,6 +309,8 @@ export function RegisterApp({ initialPath, onExitToHome }: Props) {
               registration.
             </span>
           </label>
+          <TurnstileField onToken={setCaptchaToken} />
+          {checkEmail ? <p className="text-sm font-bold text-emerald-800">{checkEmail}</p> : null}
           {error ? <p className="text-sm font-bold text-red-700">{error}</p> : null}
           <button type="submit" className="btn-primary w-full" disabled={busy}>
             {busy ? "Starting…" : "Continue"}
@@ -351,7 +371,7 @@ export function RegisterApp({ initialPath, onExitToHome }: Props) {
             onChange={(v) => {
               setForm((f) => ({ ...f, referralQuery: v }));
               if (v.trim().length >= 2) {
-                void lookupReferrer(v)
+                void lookupReferrer(v, { email: form.email, mobile: form.mobile })
                   .then((r) => setReferrerHits(r.results || []))
                   .catch(() => setReferrerHits([]));
               }
@@ -359,13 +379,13 @@ export function RegisterApp({ initialPath, onExitToHome }: Props) {
           />
           <ul className="space-y-2">
             {referrerHits.map((hit) => (
-              <li key={hit.participantId}>
+              <li key={hit.memberIdNo}>
                 <button
                   type="button"
                   className="w-full rounded-xl border border-slate-200 px-3 py-2 text-left text-sm font-semibold"
                   onClick={() => {
-                    setForm((f) => ({ ...f, referredByParticipantId: hit.participantId, referralQuery: hit.memberIdNo }));
-                    void persist({ referredByParticipantId: hit.participantId });
+                    setForm((f) => ({ ...f, referredByParticipantId: hit.participantId || hit.memberIdNo, referralQuery: hit.memberIdNo }));
+                    void persist({ referredByParticipantId: hit.participantId || hit.memberIdNo });
                   }}
                 >
                   {hit.displayName} · {hit.memberIdNo}
@@ -428,6 +448,7 @@ export function RegisterApp({ initialPath, onExitToHome }: Props) {
           <p>Membership fee declared paid: {form.membershipFeePaid ? "yes" : "no"}</p>
         </div>
       ) : null}
+      {step === 4 ? <div className="mt-4"><TurnstileField onToken={setCaptchaToken} /></div> : null}
       {error ? <p className="mt-4 text-sm font-bold text-red-700">{error}</p> : null}
       <div className="mt-6 flex gap-3">
         {step > 0 ? (

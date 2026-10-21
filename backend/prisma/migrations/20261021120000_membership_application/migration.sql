@@ -20,19 +20,46 @@ CREATE TYPE "PaymentMode" AS ENUM ('CASH', 'GCASH');
 ALTER TABLE "Participant" ADD COLUMN IF NOT EXISTS "tinMissingFlaggedAt" TIMESTAMP(3);
 ALTER TABLE "Participant" ADD COLUMN IF NOT EXISTS "registrationSource" TEXT;
 
+-- Normalize blanks to NULL so unique indexes do not collide on empty strings.
+UPDATE "Participant" SET "memberIdNo" = NULL WHERE "memberIdNo" IS NOT NULL AND BTRIM("memberIdNo") = '';
+UPDATE "Participant" SET "tinNo" = NULL WHERE "tinNo" IS NOT NULL AND BTRIM("tinNo") = '';
+
+-- Fail closed if duplicates remain. Run the report scripts on a staging Neon branch first.
+-- Do not apply this migration to live production Neon from this PR.
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM "Participant"
+    WHERE "memberIdNo" IS NOT NULL
+    GROUP BY "memberIdNo"
+    HAVING COUNT(*) > 1
+  ) THEN
+    RAISE EXCEPTION 'Duplicate memberIdNo values exist. Run backend/scripts/report-duplicate-member-id-no.sql on a staging branch and resolve before migrating.';
+  END IF;
+  IF EXISTS (
+    SELECT 1 FROM "Participant"
+    WHERE "tinNo" IS NOT NULL
+    GROUP BY "tinNo"
+    HAVING COUNT(*) > 1
+  ) THEN
+    RAISE EXCEPTION 'Duplicate tinNo values exist. Run backend/scripts/report-duplicate-tin-no.sql on a staging branch and resolve before migrating.';
+  END IF;
+END $$;
+
 -- Unique member ID (nullable values stay unique-per-value; multiple NULLs are allowed)
 CREATE UNIQUE INDEX IF NOT EXISTS "Participant_memberIdNo_key" ON "Participant"("memberIdNo");
 
--- Optional unique TIN when present
-CREATE UNIQUE INDEX IF NOT EXISTS "Participant_tinNo_unique_not_null"
-  ON "Participant"("tinNo")
-  WHERE "tinNo" IS NOT NULL AND BTRIM("tinNo") <> '';
+-- Unique TIN when set (aligned with Prisma @@unique; blanks already normalized to NULL)
+CREATE UNIQUE INDEX IF NOT EXISTS "Participant_tinNo_key" ON "Participant"("tinNo");
 
 -- CreateTable
 CREATE TABLE "MembershipApplication" (
     "id" TEXT NOT NULL,
     "status" "MembershipApplicationStatus" NOT NULL DEFAULT 'DRAFT',
     "resumeTokenHash" TEXT NOT NULL,
+    "resumeTokenExpiresAt" TIMESTAMP(3),
+    "pendingResumeTokenHash" TEXT,
+    "pendingResumeTokenExpiresAt" TIMESTAMP(3),
     "participantId" TEXT,
     "fullName" TEXT,
     "firstName" TEXT,
@@ -76,6 +103,7 @@ ALTER TABLE "MembershipApplication"
   CHECK ("shareCapitalAmount" >= 1000);
 
 CREATE UNIQUE INDEX "MembershipApplication_resumeTokenHash_key" ON "MembershipApplication"("resumeTokenHash");
+CREATE UNIQUE INDEX "MembershipApplication_pendingResumeTokenHash_key" ON "MembershipApplication"("pendingResumeTokenHash");
 CREATE UNIQUE INDEX "MembershipApplication_participantId_key" ON "MembershipApplication"("participantId");
 CREATE INDEX "MembershipApplication_status_idx" ON "MembershipApplication"("status");
 CREATE INDEX "MembershipApplication_email_idx" ON "MembershipApplication"("email");

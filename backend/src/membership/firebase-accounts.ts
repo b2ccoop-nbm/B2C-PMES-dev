@@ -7,6 +7,7 @@ export type FirebaseAccountsPort = {
   lookupByEmail: (email: string) => Promise<FirebaseUserLite | null>;
   signUp: (email: string, password: string, displayName: string) => Promise<FirebaseUserLite>;
   passwordResetLink: (email: string) => Promise<string>;
+  deleteUser?: (uid: string) => Promise<void>;
 };
 
 export function firebasePortFromAdmin(auth: admin.auth.Auth): FirebaseAccountsPort {
@@ -27,6 +28,9 @@ export function firebasePortFromAdmin(auth: admin.auth.Auth): FirebaseAccountsPo
     },
     async passwordResetLink(email) {
       return auth.generatePasswordResetLink(email);
+    },
+    async deleteUser(uid) {
+      await auth.deleteUser(uid);
     },
   };
 }

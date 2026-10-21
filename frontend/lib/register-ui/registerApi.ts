@@ -27,6 +27,8 @@ export type RegisterApplication = {
   dpaConsentAt: string | null;
   resumeToken?: string;
   memberIdNo?: string;
+  checkEmail?: boolean;
+  message?: string;
 };
 
 function apiBase(): string {
@@ -38,27 +40,15 @@ function apiBase(): string {
   return String(fromEnv || "").replace(/\/$/, "");
 }
 
-function storageTokenKey(id: string) {
-  return `b2c_membership_resume_${id}`;
-}
+let memoryToken: { id: string; token: string } | null = null;
 
 export function rememberResume(id: string, token: string) {
-  try {
-    localStorage.setItem(storageTokenKey(id), token);
-    localStorage.setItem("b2c_membership_application_id", id);
-  } catch {
-    /* ignore */
-  }
+  memoryToken = { id, token };
 }
 
 export function readResume(id?: string | null): { id: string | null; token: string | null } {
-  try {
-    const appId = id || localStorage.getItem("b2c_membership_application_id");
-    const token = appId ? localStorage.getItem(storageTokenKey(appId)) : null;
-    return { id: appId, token };
-  } catch {
-    return { id: null, token: null };
-  }
+  if (memoryToken && (!id || memoryToken.id === id)) return memoryToken;
+  return { id: id ?? null, token: null };
 }
 
 async function parseError(res: Response): Promise<string> {
@@ -77,7 +67,7 @@ async function req(path: string, init: RequestInit & { resumeToken?: string } = 
     headers.set("Content-Type", "application/json");
   }
   if (init.resumeToken) headers.set("X-Resume-Token", init.resumeToken);
-  const res = await fetch(`${apiBase()}${path}`, { ...init, headers });
+  const res = await fetch(`${apiBase()}${path}`, { ...init, headers, credentials: "include" });
   if (!res.ok) throw new Error(await parseError(res));
   return res.json();
 }
@@ -90,7 +80,7 @@ export async function createApplication(input: {
   referralCode?: string;
 }): Promise<RegisterApplication> {
   const body = await req("/membership/applications", { method: "POST", body: JSON.stringify(input) });
-  if (body.resumeToken) rememberResume(body.id, body.resumeToken);
+  if (body.id && body.resumeToken) rememberResume(body.id, body.resumeToken);
   return body;
 }
 
@@ -99,9 +89,19 @@ export async function loadApplication(id: string, token: string): Promise<Regist
 }
 
 export async function resumeByToken(token: string): Promise<RegisterApplication> {
-  const body = await req(`/membership/resume?t=${encodeURIComponent(token)}`);
+  const body = await req(`/membership/resume`, { method: "POST", body: JSON.stringify({ token }) });
   if (body.id && body.resumeToken) rememberResume(body.id, body.resumeToken);
   return body;
+}
+
+export async function resumeFromCookie(): Promise<RegisterApplication | null> {
+  try {
+    const body = await req(`/membership/resume`, { method: "POST", body: JSON.stringify({}) });
+    if (body.id && body.resumeToken) rememberResume(body.id, body.resumeToken);
+    return body;
+  } catch {
+    return null;
+  }
 }
 
 export async function patchApplication(id: string, token: string, fields: Record<string, unknown>) {
@@ -122,19 +122,22 @@ export async function submitApplication(id: string, token: string, captchaToken?
   return body as RegisterApplication & { memberIdNo: string; needsTin: boolean };
 }
 
-export async function lookupReferrer(q: string) {
-  return req(`/membership/referrer-lookup?q=${encodeURIComponent(q)}`) as Promise<{
-    results: { memberIdNo: string; displayName: string; participantId: string }[];
+export async function lookupReferrer(q: string, applicant?: { email?: string; mobile?: string }) {
+  const params = new URLSearchParams({ q });
+  if (applicant?.email) params.set("email", applicant.email);
+  if (applicant?.mobile) params.set("mobile", applicant.mobile);
+  return req(`/membership/referrer-lookup?${params}`) as Promise<{
+    results: { memberIdNo: string; displayName: string; participantId?: string }[];
   }>;
 }
 
 export async function uploadScreenshot(id: string, token: string, file: File) {
   const form = new FormData();
   form.set("file", file);
-  form.set("resumeToken", token);
   const res = await fetch(`${apiBase()}/membership/applications/${encodeURIComponent(id)}/gcash-screenshot`, {
     method: "POST",
     headers: { "X-Resume-Token": token },
+    credentials: "include",
     body: form,
   });
   if (!res.ok) throw new Error(await parseError(res));
@@ -144,9 +147,9 @@ export async function uploadScreenshot(id: string, token: string, file: File) {
 export function enqueueOfflinePatch(id: string, fields: Record<string, unknown>) {
   try {
     const key = `b2c_membership_offline_${id}`;
-    const prev = JSON.parse(localStorage.getItem(key) || "[]") as Record<string, unknown>[];
+    const prev = JSON.parse(sessionStorage.getItem(key) || "[]") as Record<string, unknown>[];
     prev.push(fields);
-    localStorage.setItem(key, JSON.stringify(prev));
+    sessionStorage.setItem(key, JSON.stringify(prev));
   } catch {
     /* ignore */
   }
@@ -156,7 +159,7 @@ export async function flushOfflineQueue(id: string, token: string) {
   const key = `b2c_membership_offline_${id}`;
   let queued: Record<string, unknown>[] = [];
   try {
-    queued = JSON.parse(localStorage.getItem(key) || "[]") as Record<string, unknown>[];
+    queued = JSON.parse(sessionStorage.getItem(key) || "[]") as Record<string, unknown>[];
   } catch {
     queued = [];
   }
@@ -164,5 +167,5 @@ export async function flushOfflineQueue(id: string, token: string) {
   for (const fields of queued) {
     await patchApplication(id, token, fields);
   }
-  localStorage.removeItem(key);
+  sessionStorage.removeItem(key);
 }

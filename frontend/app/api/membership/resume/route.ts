@@ -1,24 +1,23 @@
-import { getSql } from "@/lib/db";
 import { edgeCorsOptions } from "@/lib/edge-cors";
-import { toPublicApplication, type ApplicationRow } from "@/lib/membership/edge-service";
-import { membershipError } from "@/lib/membership/http";
-import { hashResumeToken, resumeCookie } from "@/lib/membership/tokens";
-import { NextResponse } from "next/server";
-import { EDGE_CORS_HEADERS } from "@/lib/edge-cors";
+import { claimResume } from "@/lib/membership/edge-service";
+import { membershipError, membershipJson } from "@/lib/membership/http";
+import { resumeCookie, resumeTokenFromRequest } from "@/lib/membership/tokens";
 
-export function OPTIONS() {
-  return edgeCorsOptions();
+export function OPTIONS(request: Request) {
+  return edgeCorsOptions(request);
 }
 
-export async function GET(request: Request) {
-  const t = new URL(request.url).searchParams.get("t") ?? "";
-  if (!t.trim()) return membershipError("Resume token is required.", 400);
-  const hash = await hashResumeToken(t.trim());
-  const sql = getSql();
-  const rows = await sql`SELECT * FROM "MembershipApplication" WHERE "resumeTokenHash" = ${hash} LIMIT 1`;
-  const row = (rows as ApplicationRow[])[0];
-  if (!row) return membershipError("This continue link is invalid or expired.", 404);
-  const res = NextResponse.json({ ...toPublicApplication(row), resumeToken: t.trim() }, { headers: EDGE_CORS_HEADERS });
-  res.headers.append("Set-Cookie", resumeCookie(t.trim()));
+export async function GET() {
+  return membershipError("Use POST /membership/resume with the continue token. Tokens are not accepted in the URL.", 405);
+}
+
+export async function POST(request: Request) {
+  const body = (await request.json().catch(() => ({}))) as { token?: string; resumeToken?: string };
+  const token = resumeTokenFromRequest(request, body.token || body.resumeToken);
+  const result = await claimResume(token);
+  const res = membershipJson(result, request);
+  if (result.ok && result.body && typeof result.body === "object" && "resumeToken" in result.body) {
+    res.headers.append("Set-Cookie", resumeCookie(String((result.body as { resumeToken: string }).resumeToken)));
+  }
   return res;
 }

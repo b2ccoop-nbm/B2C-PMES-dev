@@ -32,8 +32,12 @@ import { sendMembershipEmail } from "./mailer";
 import { allocateMemberPublicId, maskGivenName, referrerIsApproved } from "./member-id-alloc";
 import { draftIpWindow, isRateLimited, lookupIpWindow, submitEmailWindow } from "./rate-limit";
 import { derivedApplicationStatus, nextStatusAfterLifecycle } from "./status-sync";
-import { generateResumeToken, hashResumeToken } from "./tokens";
+import { publicCreateForExistingApplication } from "./existing-draft-policy";
+import { referrerConflictMessage } from "./referrer-rules";
+import { generateUploadKey, validateScreenshotBytes } from "./screenshot";
+import { generateResumeToken, hashResumeToken, isResumeTokenExpired, resumeTokenExpiresAt, tokensMatch, continueUrl } from "./tokens";
 import { verifyTurnstile } from "./turnstile";
+import { isUniqueViolation } from "./unique-violation";
 import {
   composeFullName,
   DPA_CONSENT_VERSION_DEFAULT,
@@ -219,7 +223,7 @@ export class MembershipService {
   private async loadAuthorized(id: string, token: string) {
     const row = await this.prisma.membershipApplication.findUnique({ where: { id } });
     if (!row) throw new NotFoundException("Application not found");
-    if (hashResumeToken(token) !== row.resumeTokenHash) {
+    if (!tokensMatch(token, row.resumeTokenHash) || isResumeTokenExpired(row.resumeTokenExpiresAt)) {
       throw new UnauthorizedException("Resume token is invalid.");
     }
     return row;
@@ -247,18 +251,27 @@ export class MembershipService {
       where: { email, status: { in: OPEN_STATUSES } },
     });
     if (existing) {
-      const token = generateResumeToken();
-      const updated = await this.prisma.membershipApplication.update({
-        where: { id: existing.id },
-        data: { resumeTokenHash: hashResumeToken(token), updatedAt: new Date() },
-      });
-      await this.maybeEmailResume(email, token);
-      return { ...this.publicApplication(updated), resumeToken: token, resumed: true };
+      const policy = publicCreateForExistingApplication(existing.status);
+      if (policy.emailContinue) {
+        const pending = generateResumeToken();
+        await this.prisma.membershipApplication.update({
+          where: { id: existing.id },
+          data: {
+            pendingResumeTokenHash: hashResumeToken(pending),
+            pendingResumeTokenExpiresAt: resumeTokenExpiresAt(),
+          },
+        });
+        await this.maybeEmailResume(email, pending);
+      }
+      return { checkEmail: true as const, message: policy.message };
     }
 
     let referredByParticipantId: string | null = null;
     if (input.referralCode) {
-      referredByParticipantId = await this.resolveReferrer(input.referralCode);
+      referredByParticipantId = await this.resolveReferrer(input.referralCode, {
+        applicantEmail: email,
+        applicantMobile: mobile,
+      });
     }
 
     const token = generateResumeToken();
@@ -271,6 +284,7 @@ export class MembershipService {
         consentIp: input.ip.slice(0, 64),
         userAgent: (input.userAgent ?? "").slice(0, 500),
         resumeTokenHash: hashResumeToken(token),
+        resumeTokenExpiresAt: resumeTokenExpiresAt(),
         referredByParticipantId,
         shareCapitalAmount: MIN_SHARE_CAPITAL,
         membershipFeeAmount: MEMBERSHIP_FEE_DEFAULT,
@@ -323,7 +337,11 @@ export class MembershipService {
           break;
         case "referredByParticipantId":
           if (value) {
-            const resolved = await this.requireApprovedReferrer(String(value));
+            const resolved = await this.requireApprovedReferrer(String(value), {
+              applicantEmail: row.email,
+              applicantMobile: row.mobile,
+              applicantParticipantId: row.participantId,
+            });
             data.referredByParticipantId = resolved;
           } else {
             data.referredByParticipantId = null;
@@ -331,7 +349,11 @@ export class MembershipService {
           break;
         case "referralQuery":
           if (value) {
-            const resolved = await this.resolveReferrer(String(value));
+            const resolved = await this.resolveReferrer(String(value), {
+              applicantEmail: row.email,
+              applicantMobile: row.mobile,
+              applicantParticipantId: row.participantId,
+            });
             if (resolved) data.referredByParticipantId = resolved;
           }
           break;
@@ -432,7 +454,11 @@ export class MembershipService {
     }
 
     if (row.referredByParticipantId) {
-      await this.requireApprovedReferrer(row.referredByParticipantId);
+      await this.requireApprovedReferrer(row.referredByParticipantId, {
+        applicantEmail: row.email,
+        applicantMobile: row.mobile,
+        applicantParticipantId: row.participantId,
+      });
     }
 
     const lookup = await this.duplicateLookup();
@@ -470,95 +496,125 @@ export class MembershipService {
     }
 
     const existingParticipant = await this.prisma.participant.findUnique({ where: { email: row.email } });
-    let firebaseUid: string | null = existingParticipant?.firebaseUid ?? null;
+    const newToken = generateResumeToken();
+    let result: { participant: { id: string; memberIdNo: string | null; firebaseUid: string | null }; application: typeof row } | null = null;
+    let lastUniqueError: unknown;
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const memberIdNo =
+        existingParticipant?.memberIdNo ||
+        (await allocateMemberPublicId({
+          fullName,
+          firstName: row.firstName,
+          lastName: row.lastName,
+          dob: dobIso,
+          exists: async (candidate) => {
+            const hit = await this.prisma.participant.findFirst({ where: { memberIdNo: candidate } });
+            return Boolean(hit);
+          },
+        }));
+      try {
+        result = await this.prisma.$transaction(async (tx) => {
+          const participant = existingParticipant
+            ? await tx.participant.update({
+                where: { id: existingParticipant.id },
+                data: {
+                  fullName,
+                  phone: mobile,
+                  dob: dobIso,
+                  gender: String(row.gender).trim(),
+                  tinNo: tin,
+                  mailingAddress: mailing || existingParticipant.mailingAddress,
+                  memberIdNo: existingParticipant.memberIdNo || memberIdNo,
+                  referredByParticipantId: existingParticipant.referredByParticipantId ?? row.referredByParticipantId,
+                  tinMissingFlaggedAt: tin ? null : new Date(),
+                  registrationSource: existingParticipant.registrationSource ?? "online_form",
+                },
+              })
+            : await tx.participant.create({
+                data: {
+                  fullName,
+                  email: row.email,
+                  phone: mobile,
+                  dob: dobIso,
+                  gender: String(row.gender).trim(),
+                  tinNo: tin,
+                  mailingAddress: mailing || null,
+                  memberIdNo,
+                  referredByParticipantId: row.referredByParticipantId,
+                  tinMissingFlaggedAt: tin ? null : new Date(),
+                  registrationSource: "online_form",
+                },
+              });
+
+          const application = await tx.membershipApplication.update({
+            where: { id: row.id },
+            data: {
+              status: MembershipApplicationStatus.SUBMITTED,
+              participantId: participant.id,
+              fullName,
+              submittedAt: new Date(),
+              resumeTokenHash: hashResumeToken(newToken),
+              resumeTokenExpiresAt: resumeTokenExpiresAt(),
+              possibleDuplicateOfId: firstFlaggedParticipantId(dups),
+              paymentDeclaredAt: row.shareCapitalPaid || row.membershipFeePaid ? row.paymentDeclaredAt ?? new Date() : row.paymentDeclaredAt,
+            },
+          });
+          return { participant, application };
+        });
+        break;
+      } catch (e) {
+        lastUniqueError = e;
+        if (!isUniqueViolation(e) || existingParticipant?.memberIdNo) throw e;
+      }
+    }
+    if (!result) {
+      throw lastUniqueError instanceof Error ? lastUniqueError : new Error("Could not allocate a unique member ID.");
+    }
+
     let resetLink: string | null = null;
-    if (existingParticipant?.firebaseUid) {
+    let firebaseUid = result.participant.firebaseUid ?? existingParticipant?.firebaseUid ?? null;
+    if (firebaseUid) {
       const created = await createFirebaseMemberAccount(row.email, fullName, this.firebase);
-      if (created.uid !== existingParticipant.firebaseUid) {
+      if (created.uid !== firebaseUid) {
         throw new ConflictException("Already registered — sign in or reset password");
       }
-      firebaseUid = created.uid;
       resetLink = created.resetLink;
     } else {
       const created = await createFirebaseMemberAccount(row.email, fullName, this.firebase);
       const other = await this.prisma.participant.findFirst({
-        where: { firebaseUid: created.uid, NOT: existingParticipant ? { id: existingParticipant.id } : undefined },
+        where: { firebaseUid: created.uid, NOT: { id: result.participant.id } },
       });
       if (other) {
+        if (created.created) {
+          await this.firebase.deleteUser?.(created.uid).catch((e) =>
+            this.logger.warn(`Firebase compensate delete skipped: ${e instanceof Error ? e.message : e}`),
+          );
+        }
         throw new ConflictException("Already registered — sign in or reset password");
       }
-      firebaseUid = created.uid;
-      resetLink = created.resetLink;
+      try {
+        await this.prisma.participant.update({
+          where: { id: result.participant.id },
+          data: { firebaseUid: created.uid },
+        });
+        firebaseUid = created.uid;
+        resetLink = created.resetLink;
+      } catch (e) {
+        if (created.created) {
+          await this.firebase.deleteUser?.(created.uid).catch((err) =>
+            this.logger.warn(`Firebase compensate delete skipped: ${err instanceof Error ? err.message : err}`),
+          );
+        }
+        throw e;
+      }
     }
-
-    const memberIdNo = await allocateMemberPublicId({
-      fullName,
-      firstName: row.firstName,
-      lastName: row.lastName,
-      dob: dobIso,
-      exists: async (candidate) => {
-        const hit = await this.prisma.participant.findFirst({ where: { memberIdNo: candidate } });
-        return Boolean(hit);
-      },
-    });
-
-    const newToken = generateResumeToken();
-    const result = await this.prisma.$transaction(async (tx) => {
-      const participant = existingParticipant
-        ? await tx.participant.update({
-            where: { id: existingParticipant.id },
-            data: {
-              fullName,
-              phone: mobile,
-              dob: dobIso,
-              gender: String(row.gender).trim(),
-              tinNo: tin,
-              mailingAddress: mailing || existingParticipant.mailingAddress,
-              firebaseUid,
-              memberIdNo: existingParticipant.memberIdNo || memberIdNo,
-              referredByParticipantId: existingParticipant.referredByParticipantId ?? row.referredByParticipantId,
-              tinMissingFlaggedAt: tin ? null : new Date(),
-              registrationSource: existingParticipant.registrationSource ?? "online_form",
-            },
-          })
-        : await tx.participant.create({
-            data: {
-              fullName,
-              email: row.email,
-              phone: mobile,
-              dob: dobIso,
-              gender: String(row.gender).trim(),
-              tinNo: tin,
-              mailingAddress: mailing || null,
-              firebaseUid,
-              memberIdNo,
-              referredByParticipantId: row.referredByParticipantId,
-              tinMissingFlaggedAt: tin ? null : new Date(),
-              registrationSource: "online_form",
-            },
-          });
-
-      const application = await tx.membershipApplication.update({
-        where: { id: row.id },
-        data: {
-          status: MembershipApplicationStatus.SUBMITTED,
-          participantId: participant.id,
-          fullName,
-          submittedAt: new Date(),
-          resumeTokenHash: hashResumeToken(newToken),
-          possibleDuplicateOfId: firstFlaggedParticipantId(dups),
-          paymentDeclaredAt: row.shareCapitalPaid || row.membershipFeePaid ? row.paymentDeclaredAt ?? new Date() : row.paymentDeclaredAt,
-        },
-      });
-      return { participant, application };
-    });
 
     const setPwUrl = resetLink || `${this.publicAppUrl()}/set-password`;
     await sendMembershipEmail(
       setPasswordEmail({
         to: row.email,
         fullName,
-        memberIdNo: result.participant.memberIdNo ?? memberIdNo,
+        memberIdNo: result.participant.memberIdNo ?? "",
         setPasswordUrl: setPwUrl,
       }),
     ).catch((e) => this.logger.warn(`set-password email skipped: ${e instanceof Error ? e.message : e}`));
@@ -577,21 +633,56 @@ export class MembershipService {
 
   async resendResumeLink(id: string, token: string) {
     const row = await this.loadAuthorized(id, token);
-    const next = generateResumeToken();
+    const pending = generateResumeToken();
     await this.prisma.membershipApplication.update({
       where: { id: row.id },
-      data: { resumeTokenHash: hashResumeToken(next) },
+      data: {
+        pendingResumeTokenHash: hashResumeToken(pending),
+        pendingResumeTokenExpiresAt: resumeTokenExpiresAt(),
+      },
     });
-    await this.maybeEmailResume(row.email, next);
-    return { ok: true, resumeToken: next };
+    await this.maybeEmailResume(row.email, pending);
+    return { ok: true, emailed: true };
   }
 
-  async lookupReferrer(q: string, ip: string) {
+  async claimResume(token: string) {
+    const plain = String(token ?? "").trim();
+    if (!plain) throw new UnauthorizedException("Resume token is invalid.");
+    const hash = hashResumeToken(plain);
+    const byLive = await this.prisma.membershipApplication.findUnique({ where: { resumeTokenHash: hash } });
+    if (byLive) {
+      if (isResumeTokenExpired(byLive.resumeTokenExpiresAt)) {
+        throw new UnauthorizedException("This continue link is invalid or expired.");
+      }
+      return { ...this.publicApplication(byLive), resumeToken: plain };
+    }
+    const byPending = await this.prisma.membershipApplication.findFirst({ where: { pendingResumeTokenHash: hash } });
+    if (!byPending || isResumeTokenExpired(byPending.pendingResumeTokenExpiresAt)) {
+      throw new UnauthorizedException("This continue link is invalid or expired.");
+    }
+    const next = generateResumeToken();
+    const updated = await this.prisma.membershipApplication.update({
+      where: { id: byPending.id },
+      data: {
+        resumeTokenHash: hashResumeToken(next),
+        resumeTokenExpiresAt: resumeTokenExpiresAt(),
+        pendingResumeTokenHash: null,
+        pendingResumeTokenExpiresAt: null,
+      },
+    });
+    return { ...this.publicApplication(updated), resumeToken: next };
+  }
+
+  async lookupReferrer(q: string, ip: string, applicant?: { email?: string; mobile?: string; participantId?: string | null }) {
     await this.consumeRateLimit(lookupIpWindow(ip));
     const query = String(q ?? "").trim();
     if (query.length < 2) return { results: [] as { memberIdNo: string; displayName: string }[] };
 
-    const resolved = await this.resolveReferrer(query);
+    const resolved = await this.resolveReferrer(query, {
+      applicantEmail: applicant?.email,
+      applicantMobile: applicant?.mobile,
+      applicantParticipantId: applicant?.participantId,
+    });
     if (resolved) {
       const p = await this.prisma.participant.findUnique({ where: { id: resolved } });
       if (p && referrerIsApproved(p)) {
@@ -609,20 +700,35 @@ export class MembershipService {
         ],
       },
       take: 8,
-      select: { fullName: true, memberIdNo: true, id: true },
+      select: { fullName: true, memberIdNo: true, id: true, email: true, phone: true },
     });
     return {
       results: rows
         .filter((r) => r.memberIdNo)
-        .map((r) => ({ memberIdNo: r.memberIdNo as string, displayName: maskGivenName(r.fullName), participantId: r.id })),
+        .filter((r) => !referrerConflictMessage({
+          referrerId: r.id,
+          referrerEmail: r.email,
+          referrerPhone: r.phone,
+          applicantEmail: applicant?.email,
+          applicantMobile: applicant?.mobile,
+          applicantParticipantId: applicant?.participantId,
+        }))
+        .map((r) => ({ memberIdNo: r.memberIdNo as string, displayName: maskGivenName(r.fullName) })),
     };
   }
 
-  async attachScreenshot(id: string, token: string, key: string) {
+  async attachScreenshot(id: string, token: string, bytes: Uint8Array | Buffer) {
     const row = await this.loadAuthorized(id, token);
+    const valid = validateScreenshotBytes(bytes);
+    if (!valid.ok) throw new BadRequestException(valid.message);
+    const key = generateUploadKey(id, valid.mime);
+    const storedKey =
+      process.env.NODE_ENV === "test" || String(process.env.MEMBERSHIP_ALLOW_MOCK_UPLOADS ?? "").trim() === "1"
+        ? `mock:${key}`
+        : key;
     const updated = await this.prisma.membershipApplication.update({
       where: { id: row.id },
-      data: { gcashScreenshotKey: key, paymentDeclaredAt: new Date() },
+      data: { gcashScreenshotKey: storedKey, paymentDeclaredAt: new Date() },
     });
     if (updated.status !== MembershipApplicationStatus.DRAFT) {
       await this.notifyTreasurers(updated);
@@ -637,7 +743,7 @@ export class MembershipService {
       data: { status: MembershipApplicationStatus.EXPIRED },
     });
     const stale = await this.prisma.membershipApplication.findMany({
-      where: { status: MembershipApplicationStatus.EXPIRED, updatedAt: { lt: cutoff } },
+      where: { status: MembershipApplicationStatus.EXPIRED, createdAt: { lt: cutoff } },
       select: { id: true },
       take: 200,
     });
@@ -772,7 +878,13 @@ export class MembershipService {
     if (row.status === MembershipApplicationStatus.APPROVED) {
       throw new BadRequestException("Referrer can only be corrected before approval.");
     }
-    const resolved = referrerId ? await this.requireApprovedReferrer(referrerId) : null;
+    const resolved = referrerId
+      ? await this.requireApprovedReferrer(referrerId, {
+          applicantEmail: row.email,
+          applicantMobile: row.mobile,
+          applicantParticipantId: row.participantId,
+        })
+      : null;
     const updated = await this.prisma.membershipApplication.update({
       where: { id },
       data: { referredByParticipantId: resolved },
@@ -803,41 +915,58 @@ export class MembershipService {
     }
   }
 
-  private async requireApprovedReferrer(idOrQuery: string): Promise<string> {
-    const resolved = await this.resolveReferrer(idOrQuery);
+  private async requireApprovedReferrer(
+    idOrQuery: string,
+    applicant?: { applicantEmail?: string | null; applicantMobile?: string | null; applicantParticipantId?: string | null },
+  ): Promise<string> {
+    const resolved = await this.resolveReferrer(idOrQuery, applicant);
     if (!resolved) throw new BadRequestException("Referred by must be an approved member.");
     return resolved;
   }
 
-  async resolveReferrer(raw: string): Promise<string | null> {
+  async resolveReferrer(
+    raw: string,
+    applicant?: { applicantEmail?: string | null; applicantMobile?: string | null; applicantParticipantId?: string | null },
+  ): Promise<string | null> {
     const q = String(raw ?? "").trim();
     if (!q) return null;
+
+    let candidate: { id: string; email?: string | null; phone?: string | null; boardApprovedAt?: Date | string | null } | null = null;
 
     const pioneer = q.match(/^PIONEER-([a-fA-F0-9]{8})$/i);
     if (pioneer?.[1]) {
       const suffix = pioneer[1].toUpperCase();
-      const rows = await this.prisma.$queryRaw<Array<{ id: string; boardApprovedAt: Date | null }>>`
-        SELECT id, "boardApprovedAt" FROM "Participant"
+      const rows = await this.prisma.$queryRaw<Array<{ id: string; boardApprovedAt: Date | null; email: string; phone: string | null }>>`
+        SELECT id, "boardApprovedAt", email, phone FROM "Participant"
         WHERE "firebaseUid" IS NOT NULL
           AND UPPER(RIGHT(REPLACE("firebaseUid", '-', ''), 8)) = ${suffix}
         LIMIT 2
       `;
-      if (rows.length === 1 && referrerIsApproved(rows[0]!)) return rows[0]!.id;
-      return null;
+      if (rows.length === 1 && referrerIsApproved(rows[0]!)) candidate = rows[0]!;
+    } else {
+      candidate = await this.prisma.participant.findFirst({
+        where: {
+          OR: [{ id: q }, { memberIdNo: q }, { callsign: q.toLowerCase() }],
+          boardApprovedAt: { not: null },
+        },
+        select: { id: true, email: true, phone: true, boardApprovedAt: true },
+      });
     }
-
-    const byId = await this.prisma.participant.findFirst({
-      where: {
-        OR: [{ id: q }, { memberIdNo: q }, { callsign: q.toLowerCase() }],
-        boardApprovedAt: { not: null },
-      },
-      select: { id: true },
+    if (!candidate) return null;
+    const conflict = referrerConflictMessage({
+      referrerId: candidate.id,
+      referrerEmail: candidate.email,
+      referrerPhone: candidate.phone,
+      applicantEmail: applicant?.applicantEmail,
+      applicantMobile: applicant?.applicantMobile,
+      applicantParticipantId: applicant?.applicantParticipantId,
     });
-    return byId?.id ?? null;
+    if (conflict) throw new BadRequestException(conflict);
+    return candidate.id;
   }
 
   private async maybeEmailResume(email: string, token: string) {
-    const url = `${this.publicAppUrl()}/register/continue?t=${encodeURIComponent(token)}`;
+    const url = continueUrl(this.publicAppUrl(), token);
     await sendMembershipEmail(resumeEmail({ to: email, continueUrl: url })).catch((e) =>
       this.logger.warn(`resume email skipped: ${e instanceof Error ? e.message : e}`),
     );

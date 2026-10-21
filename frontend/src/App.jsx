@@ -353,6 +353,7 @@ function formatTtsError(err) {
 export default function App() {
   const [registerPath, setRegisterPath] = useState(/** @type {string | null} */ (null));
   const [tinPromptOpen, setTinPromptOpen] = useState(false);
+  const [tinDismissedThisView, setTinDismissedThisView] = useState(false);
   const [appState, setAppState] = useState("landing");
   const appStateRef = useRef(appState);
   useEffect(() => {
@@ -403,15 +404,17 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    if (membershipLifecycle?.needsTin === true && user?.email) {
-      const dismissed = sessionStorage.getItem("b2c_tin_prompt_dismissed");
-      if (dismissed !== String(user.email).toLowerCase()) {
-        setTinPromptOpen(true);
-      }
-    } else {
+    if (!user?.email) {
+      setTinDismissedThisView(false);
+      setTinPromptOpen(false);
+      return;
+    }
+    if (membershipLifecycle?.needsTin === true && !tinDismissedThisView) {
+      setTinPromptOpen(true);
+    } else if (membershipLifecycle?.needsTin !== true) {
       setTinPromptOpen(false);
     }
-  }, [membershipLifecycle?.needsTin, user?.email]);
+  }, [membershipLifecycle?.needsTin, user?.email, tinDismissedThisView]);
 
   const [signUp, setSignUp] = useState({
     firstName: "",
@@ -1605,11 +1608,6 @@ export default function App() {
     } catch {
       /* ignore */
     }
-    try {
-      sessionStorage.removeItem("b2c_tin_prompt_dismissed");
-    } catch {
-      /* ignore */
-    }
     setPmesPaused(false);
     setMembershipLifecycle(null);
     setAppState("landing");
@@ -2106,8 +2104,8 @@ export default function App() {
     <TinPromptModal
       open={tinPromptOpen}
       onDismiss={() => {
+        setTinDismissedThisView(true);
         setTinPromptOpen(false);
-        if (user?.email) sessionStorage.setItem("b2c_tin_prompt_dismissed", String(user.email).toLowerCase());
       }}
       onSave={async (tin) => {
         const idToken = await auth.currentUser?.getIdToken();

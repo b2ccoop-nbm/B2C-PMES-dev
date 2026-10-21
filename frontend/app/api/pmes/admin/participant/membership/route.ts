@@ -5,7 +5,7 @@ import { EDGE_CORS_HEADERS, edgeCorsOptions } from "@/lib/edge-cors";
 import { requireStaff, unauthorized, forbidden } from "@/lib/staff-edge-auth";
 import { toLifecyclePayload } from "@/lib/pmes-edge/admin-lifecycle";
 import { selectAdminLifecycleRowByParticipantId } from "@/lib/pmes-edge/admin-participant-queries";
-import { assertPmesPassedForSecretary } from "@/lib/membership/pmes-gate";
+import { assertPmesPassedForSecretary, forcePmesOverrideAudit } from "@/lib/membership/pmes-gate";
 import { syncApplicationFromParticipant } from "@/lib/membership/edge-service";
 
 export function OPTIONS() {
@@ -47,12 +47,23 @@ export async function PATCH(request: Request) {
       const pmesRows = await getSql()`
         SELECT id FROM "PmesRecord" WHERE "participantId" = ${participantId} AND passed = true LIMIT 1
       `;
-      const gate = assertPmesPassedForSecretary((pmesRows as { id: string }[]).length > 0, {
-        force: body?.forcePmesOverride === true,
+      const pmesPassed = (pmesRows as { id: string }[]).length > 0;
+      const force = body?.forcePmesOverride === true;
+      const gate = assertPmesPassedForSecretary(pmesPassed, {
+        force,
         actorRole: staff.role,
       });
       if (!gate.ok) {
         return NextResponse.json({ message: gate.message, statusCode: 400 }, { status: 400, headers: EDGE_CORS_HEADERS });
+      }
+      const audit = forcePmesOverrideAudit({
+        participantId,
+        actorRole: staff.role,
+        force,
+        pmesPassed,
+      });
+      if (audit.shouldLog) {
+        console.warn(audit.message);
       }
     }
 

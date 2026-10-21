@@ -24,6 +24,8 @@ jobs:
           PREFLIGHT_ENV_FILE: ${{ github.workspace }}/frontend/.env.production.ci
       - run: npm run lint
         working-directory: frontend
+      - run: npm test
+        working-directory: frontend
       - run: npm run build
         working-directory: frontend
       - run: npx playwright install --with-deps chromium

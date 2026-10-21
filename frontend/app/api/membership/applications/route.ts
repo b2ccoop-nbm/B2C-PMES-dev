@@ -4,8 +4,8 @@ import { membershipJson } from "@/lib/membership/http";
 import { clientIpFromHeaders, resumeCookie } from "@/lib/membership/tokens";
 import { NextResponse } from "next/server";
 
-export function OPTIONS() {
-  return edgeCorsOptions();
+export function OPTIONS(request: Request) {
+  return edgeCorsOptions(request);
 }
 
 export async function POST(request: Request) {
@@ -25,7 +25,7 @@ export async function POST(request: Request) {
     ip: clientIpFromHeaders(request.headers),
     userAgent: request.headers.get("user-agent") ?? "",
   });
-  const res = membershipJson(result);
+  const res = membershipJson(result, request);
   if (result.ok && result.body && typeof result.body === "object" && "resumeToken" in result.body) {
     res.headers.append("Set-Cookie", resumeCookie(String((result.body as { resumeToken: string }).resumeToken)));
   }

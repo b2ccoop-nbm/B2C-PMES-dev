@@ -1,5 +1,6 @@
 import {
   hasFirebaseServiceAccountConfig,
+  identityToolkitDeleteUser,
   identityToolkitLookupByEmail,
   identityToolkitPasswordResetLink,
   identityToolkitSignUp,
@@ -31,4 +32,9 @@ export async function createFirebaseMemberAccount(
   const created = await identityToolkitSignUp(pid, email, generateUnusablePassword(), displayName);
   const resetLink = await identityToolkitPasswordResetLink(pid, email).catch(() => null);
   return { uid: created.localId, created: true, resetLink };
+}
+
+export async function deleteFirebaseMemberAccount(uid: string): Promise<void> {
+  if (!hasFirebaseServiceAccountConfig()) return;
+  await identityToolkitDeleteUser(projectId(), uid);
 }

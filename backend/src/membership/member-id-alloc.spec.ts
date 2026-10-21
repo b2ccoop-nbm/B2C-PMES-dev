@@ -22,6 +22,26 @@ describe("member ID allocation", () => {
     expect(calls).toBeGreaterThanOrEqual(3);
   });
 
+  it("retries when insert hits a unique violation", async () => {
+    let attempts = 0;
+    const id = await allocateMemberPublicId({
+      fullName: "Juan Cruz",
+      firstName: "Juan",
+      lastName: "Cruz",
+      dob: "1990-01-01",
+      exists: async () => false,
+      tryInsert: async () => {
+        attempts += 1;
+        if (attempts < 3) {
+          const err = Object.assign(new Error("duplicate key"), { code: "P2002" });
+          throw err;
+        }
+      },
+    });
+    expect(id.startsWith("B2C-JC-90-")).toBe(true);
+    expect(attempts).toBe(3);
+  });
+
   it("fails after the configured retry budget", async () => {
     await expect(
       allocateMemberPublicId({

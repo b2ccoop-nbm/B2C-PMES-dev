@@ -65,8 +65,8 @@ model Participant {
   /** Denormalized from full profile for search/list (present address formatted) */
   mailingAddress      String?   @db.Text
   civilStatus           String?
-  /** Normalized digits (typically 9). Legacy roster reclaim; do not confuse with `memberIdNo` (B2C public ID). */
-  tinNo                 String?
+  /** Normalized digits (typically 9). Unique when set; blanks are stored as NULL. */
+  tinNo                 String?   @unique
   /** B2C public login ID (`B2C-II-YY-XXXX`). Unique when set. */
   memberIdNo            String?   @unique
   /** Set when an online application is submitted without TIN; cleared when TIN is saved. */
@@ -129,6 +129,9 @@ model MembershipApplication {
   id                      String                       @id @default(uuid())
   status                  MembershipApplicationStatus  @default(DRAFT)
   resumeTokenHash         String                       @unique
+  resumeTokenExpiresAt    DateTime?
+  pendingResumeTokenHash  String?                      @unique
+  pendingResumeTokenExpiresAt DateTime?
   participantId           String?                      @unique
   participant             Participant?                 @relation(fields: [participantId], references: [id], onDelete: SetNull)
   fullName                String?

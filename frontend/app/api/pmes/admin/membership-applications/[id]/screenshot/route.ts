@@ -21,7 +21,7 @@ export async function GET(request: Request, ctx: { params: Promise<{ id: string 
     if (!key) return NextResponse.json({ message: "No screenshot" }, { status: 404, headers: EDGE_CORS_HEADERS });
     const file = await readGcashScreenshot(key);
     if (!file) {
-      return NextResponse.json({ message: "Screenshot not available", key }, { status: 404, headers: EDGE_CORS_HEADERS });
+      return NextResponse.json({ message: "Screenshot not available" }, { status: 404, headers: EDGE_CORS_HEADERS });
     }
     return new NextResponse(Buffer.from(file.body), {
       headers: { ...EDGE_CORS_HEADERS, "Content-Type": file.contentType, "Cache-Control": "private, max-age=60" },

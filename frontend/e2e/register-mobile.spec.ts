@@ -33,6 +33,7 @@ test("mobile register stepper auto-saves and reaches review", async ({ page }) =
   await page.setViewportSize({ width: 390, height: 844 });
   await page.goto("/register");
   await expect(page.getByRole("heading", { name: /apply for membership/i })).toBeVisible();
+  await expect(page.getByTestId("turnstile-widget")).toBeVisible();
   await page.getByLabel("Email").fill("e2e@example.com");
   await page.getByLabel("Mobile").fill("09171234567");
   await page.getByText(/data privacy act/i).click();

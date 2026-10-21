@@ -1,4 +1,5 @@
 import { buildMemberPublicId, cohortYYFromDob, initialsFromFirstLast, initialsFromFullName } from "../pmes/member-public-id";
+import { isUniqueViolation } from "./unique-violation";
 import { MEMBER_ID_COLLISION_RETRIES } from "./validators";
 
 export async function allocateMemberPublicId(opts: {
@@ -8,6 +9,7 @@ export async function allocateMemberPublicId(opts: {
   dob: string;
   createdAt?: Date;
   exists: (id: string) => Promise<boolean>;
+  tryInsert?: (id: string) => Promise<void>;
   maxAttempts?: number;
 }): Promise<string> {
   const initials =
@@ -18,6 +20,15 @@ export async function allocateMemberPublicId(opts: {
   const attempts = opts.maxAttempts ?? MEMBER_ID_COLLISION_RETRIES;
   for (let i = 0; i < attempts; i++) {
     const id = buildMemberPublicId(initials, yy);
+    if (opts.tryInsert) {
+      try {
+        await opts.tryInsert(id);
+        return id;
+      } catch (e) {
+        if (isUniqueViolation(e)) continue;
+        throw e;
+      }
+    }
     if (!(await opts.exists(id))) return id;
   }
   throw new Error(`Could not allocate a unique member ID after ${attempts} retries.`);

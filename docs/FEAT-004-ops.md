@@ -8,9 +8,10 @@ Run on a **staging / disposable** Neon branch only:
 
 ```bash
 psql "$STAGING_DATABASE_URL" -f backend/scripts/report-duplicate-member-id-no.sql
+psql "$STAGING_DATABASE_URL" -f backend/scripts/report-duplicate-tin-no.sql
 ```
 
-Resolve any duplicate `memberIdNo` rows before deploying the unique index.
+Resolve any duplicate `memberIdNo` or `tinNo` rows before deploying the unique indexes. The migration normalizes blank values to NULL first and aborts if duplicates remain. Do not apply it to live Neon from this PR.
 
 ## Secrets to set after merge (Worker + Nest)
 
@@ -23,12 +24,14 @@ Resolve any duplicate `memberIdNo` rows before deploying the unique index.
 | `GMAIL_OAUTH_CLIENT_SECRET` | Gmail API OAuth secret |
 | `GMAIL_OAUTH_REFRESH_TOKEN` | Refresh token for b2ccoop@gmail.com |
 | `GMAIL_FROM` | Default `b2ccoop@gmail.com` |
-| `MEMBERSHIP_CRON_SECRET` | Protects `POST /membership/cron` |
+| `MEMBERSHIP_CRON_SECRET` | Required. Cron **fails closed** (401) if unset or wrong |
 | `PUBLIC_APP_URL` | Used in emailed continue / set-password links |
 | `MEMBERSHIP_UPLOADS` | R2 bucket binding (private GCash screenshots) |
 | Existing `FIREBASE_PROJECT_ID`, `FIREBASE_CLIENT_EMAIL`, `FIREBASE_PRIVATE_KEY` | Server-side `accounts:signUp` + `sendOobCode` |
 
 Until Gmail OAuth is granted, leave `GMAIL_SENDING_ENABLED` unset/false. The mailer returns `{ mocked: true }` and tests must keep it off.
+
+Turnstile verify **fails closed** when `TURNSTILE_SECRET_KEY` is unset (except `NODE_ENV=test`). CORS is an allowlist (`b2ccoop.com` + localhost + `PUBLIC_APP_URL` / `MEMBERSHIP_CORS_ORIGINS`), never `*`. Resume tokens are hashed, expire in 30 days, and are emailed as `/register/continue#c=…` (not `?t=`). Drafts are expired **and purged** at 60 days from `createdAt`.
 
 ## Cloudflare WAF (document only — do not attach to prod in this PR)
 

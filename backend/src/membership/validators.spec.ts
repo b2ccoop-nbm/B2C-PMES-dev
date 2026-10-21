@@ -1,6 +1,7 @@
 import {
   ageYearsOn,
   isAtLeastMinAge,
+  isValidEmail,
   isValidTin,
   normalizePhMobile,
   parseIsoDateOnly,
@@ -24,6 +25,12 @@ describe("membership validators", () => {
     expect(normalizePhMobile("+63 917 123 4567")).toBe("+639171234567");
     expect(normalizePhMobile("9171234567")).toBe("+639171234567");
     expect(normalizePhMobile("12345")).toBeNull();
+  });
+
+  it("rejects empty or invalid emails", () => {
+    expect(isValidEmail("")).toBe(false);
+    expect(isValidEmail("not-an-email")).toBe(false);
+    expect(isValidEmail("juan@example.com")).toBe(true);
   });
 
   it("validates TIN 9–12 digits", () => {

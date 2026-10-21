@@ -5,7 +5,7 @@ import { requireStaff, forbidden, unauthorized } from "@/lib/staff-edge-auth";
 import { BOD_MAJORITY_APPROVALS } from "@/lib/pmes-edge/board-workflow.constants";
 import { toLifecyclePayload } from "@/lib/pmes-edge/admin-lifecycle";
 import { selectAdminLifecycleRowByParticipantId } from "@/lib/pmes-edge/admin-participant-queries";
-import { assertPmesPassedForSecretary } from "@/lib/membership/pmes-gate";
+import { assertPmesPassedForSecretary, forcePmesOverrideAudit } from "@/lib/membership/pmes-gate";
 import { syncApplicationFromParticipant } from "@/lib/membership/edge-service";
 
 const MONTHS = [
@@ -101,12 +101,22 @@ export async function POST(request: Request) {
       SELECT id FROM "PmesRecord" WHERE "participantId" = ${participantId} AND passed = true LIMIT 1
     `;
     const pmesPassed = (pmesRows as { id: string }[]).length > 0;
+    const force = body?.forcePmesOverride === true;
     const gate = assertPmesPassedForSecretary(pmesPassed, {
-      force: body?.forcePmesOverride === true,
+      force,
       actorRole: staff.role,
     });
     if (!gate.ok) {
       return NextResponse.json({ message: gate.message, statusCode: 400 }, { status: 400, headers: EDGE_CORS_HEADERS });
+    }
+    const audit = forcePmesOverrideAudit({
+      participantId,
+      actorRole: staff.role,
+      force,
+      pmesPassed,
+    });
+    if (audit.shouldLog) {
+      console.warn(audit.message);
     }
 
     const now = new Date();
