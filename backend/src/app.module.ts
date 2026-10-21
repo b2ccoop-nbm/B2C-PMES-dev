@@ -10,6 +10,7 @@ import { PrismaModule } from "./prisma/prisma.module";
 import { PmesModule } from "./pmes/pmes.module";
 import { StoreModule } from "./store/store.module";
 import { MembersModule } from "./members/members.module";
+import { MembershipModule } from "./membership/membership.module";
 
 @Module({
   imports: [
@@ -31,6 +32,7 @@ import { MembersModule } from "./members/members.module";
     PmesModule,
     StoreModule,
     MembersModule,
+    MembershipModule,
   ],
   providers: [{ provide: APP_GUARD, useClass: ThrottlerGuard }],
 })

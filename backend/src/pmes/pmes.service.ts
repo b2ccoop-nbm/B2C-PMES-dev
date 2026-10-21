@@ -42,6 +42,9 @@ import {
 import { StaffRole, type LoiSubmission, type Participant, type PmesRecord } from "@prisma/client";
 import type { StaffJwtRole } from "../auth/staff-jwt.guard";
 import { BOD_DIRECTOR_SEATS, BOD_MAJORITY_APPROVALS } from "./board-workflow.constants";
+import { assertPmesPassedForSecretary } from "../membership/pmes-gate";
+import { derivedApplicationStatus, nextStatusAfterLifecycle } from "../membership/status-sync";
+import { normalizeTinDigits as normalizeTinDigitsMembership, isValidTin } from "../membership/validators";
 
 export type MembershipStage =
   | "NO_PARTICIPANT"
@@ -530,6 +533,8 @@ export class PmesService {
         bodMajorityRequired: BOD_MAJORITY_APPROVALS,
         bodDirectorSeats: BOD_DIRECTOR_SEATS,
         boardResolutionNo: null as string | null,
+        needsTin: false,
+        tinMissingFlaggedAt: null as Date | null,
       };
     }
     const withMemberId = await this.ensureMemberPublicId(participant);
@@ -574,6 +579,7 @@ export class PmesService {
           "Use Secretary confirmation to record Board approval with a resolution number. Superuser may override here for legacy support.",
         );
       }
+      await this.assertPmesGate(dto.participantId, staff.role, dto.forcePmesOverride === true);
     }
 
     const data: {
@@ -610,6 +616,7 @@ export class PmesService {
     const votes = await this.prisma.boardApprovalVote.count({
       where: { participantId: dto.participantId, approve: true },
     });
+    await this.syncOnlineApplicationStatus(dto.participantId);
     const life = this.toLifecyclePayload(updated, votes);
     return accountingInitialFees
       ? { ...life, accountingInitialFees }
@@ -693,6 +700,7 @@ export class PmesService {
       },
     });
     if (!updated) throw new NotFoundException("Participant not found");
+    await this.syncOnlineApplicationStatus(participantId);
     const votes = await this.prisma.boardApprovalVote.count({
       where: { participantId, approve: true },
     });
@@ -700,7 +708,11 @@ export class PmesService {
   }
 
   /** Secretary issues the next Board Resolution number and sets final `boardApprovedAt`. */
-  async recordSecretaryBoardConfirmation(participantId: string, staff: { sub: string; role: StaffJwtRole }) {
+  async recordSecretaryBoardConfirmation(
+    participantId: string,
+    staff: { sub: string; role: StaffJwtRole },
+    opts?: { forcePmesOverride?: boolean },
+  ) {
     if (staff.role !== "superuser" && staff.role !== "secretary") {
       throw new ForbiddenException("Only the Secretary (or Superuser) may issue the Board resolution.");
     }
@@ -726,6 +738,8 @@ export class PmesService {
       );
     }
 
+    await this.assertPmesGate(participantId, staff.role, opts?.forcePmesOverride === true);
+
     const resolutionNo = await this.allocateNextBoardResolutionNo();
 
     const updated = await this.prisma.participant.update({
@@ -742,7 +756,34 @@ export class PmesService {
     const votes = await this.prisma.boardApprovalVote.count({
       where: { participantId, approve: true },
     });
+    await this.syncOnlineApplicationStatus(participantId);
     return this.toLifecyclePayload(updated, votes);
+  }
+
+  private async assertPmesGate(participantId: string, actorRole: StaffJwtRole, force: boolean) {
+    const passed = await this.prisma.pmesRecord.findFirst({
+      where: { participantId, passed: true },
+      select: { id: true },
+    });
+    const gate = assertPmesPassedForSecretary(Boolean(passed), { force, actorRole });
+    if (!gate.ok) {
+      throw new BadRequestException(gate.message);
+    }
+    if (force && actorRole === "superuser" && !passed) {
+      this.logger.warn(`Superuser forced secretary/board approval without PMES for participant ${participantId}`);
+    }
+  }
+
+  private async syncOnlineApplicationStatus(participantId: string) {
+    const p = await this.prisma.participant.findUnique({ where: { id: participantId } });
+    if (!p) return;
+    const app = await this.prisma.membershipApplication.findUnique({ where: { participantId } });
+    if (!app) return;
+    const derived = derivedApplicationStatus(p);
+    const next = nextStatusAfterLifecycle(app.status, derived);
+    if (next !== app.status) {
+      await this.prisma.membershipApplication.update({ where: { id: app.id }, data: { status: next } });
+    }
   }
 
   private async syncBodMajorityFlag(participantId: string) {
@@ -1506,6 +1547,8 @@ export class PmesService {
       bodMajorityRequired: BOD_MAJORITY_APPROVALS,
       bodDirectorSeats: BOD_DIRECTOR_SEATS,
       boardResolutionNo: participant.boardResolutionNo ?? null,
+      needsTin: !String(participant.tinNo ?? "").trim(),
+      tinMissingFlaggedAt: participant.tinMissingFlaggedAt ?? null,
       /** Matches `Participant.memberProfileConcurrencyStamp` for optimistic locking on full-profile submit. */
       profileRecordVersion: participant.memberProfileConcurrencyStamp,
       /** Pre-roster import: member already pledged elsewhere; digital PMES not required on this app. */
@@ -1665,6 +1708,21 @@ export class PmesService {
     if (dto.mailingAddress !== undefined) {
       const t = dto.mailingAddress.trim();
       data.mailingAddress = t ? t.slice(0, 4000) : null;
+    }
+    if (dto.tinNo !== undefined) {
+      const digits = normalizeTinDigitsMembership(dto.tinNo);
+      if (digits && !isValidTin(digits)) {
+        throw new BadRequestException("TIN must be 9–12 digits.");
+      }
+      if (digits) {
+        const clash = await this.prisma.participant.findFirst({
+          where: { tinNo: digits, NOT: { id: participant.id } },
+          select: { id: true },
+        });
+        if (clash) throw new ConflictException("This TIN is already on file. Contact the Secretary.");
+      }
+      data.tinNo = digits || null;
+      data.tinMissingFlaggedAt = digits ? null : new Date();
     }
 
     if (Object.keys(data).length === 0) {

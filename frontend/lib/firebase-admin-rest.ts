@@ -151,3 +151,33 @@ export async function identityToolkitPatchUser(
 export function normalizeMemberEmail(email: string): string {
   return normalizeEmail(email);
 }
+
+/** Server-side Firebase account create (FEAT-004 submit). */
+export async function identityToolkitSignUp(
+  projectId: string,
+  email: string,
+  password: string,
+  displayName: string,
+): Promise<{ localId: string; email?: string }> {
+  const out = await identityToolkitPost(projectToolkitPath(projectId, "accounts:signUp"), {
+    email: normalizeEmail(email),
+    password,
+    displayName,
+    returnSecureToken: false,
+  });
+  const localId = String(out.localId ?? "");
+  if (!localId) throw new Error("Firebase signUp did not return a uid");
+  return { localId, email: typeof out.email === "string" ? out.email : email };
+}
+
+/** PASSWORD_RESET oob link so we send mail from b2ccoop@gmail.com ourselves. */
+export async function identityToolkitPasswordResetLink(projectId: string, email: string): Promise<string> {
+  const out = await identityToolkitPost(projectToolkitPath(projectId, "accounts:sendOobCode"), {
+    requestType: "PASSWORD_RESET",
+    email: normalizeEmail(email),
+    returnOobLink: true,
+  });
+  const link = String(out.oobLink ?? "");
+  if (!link) throw new Error("Firebase did not return a password-reset link");
+  return link;
+}

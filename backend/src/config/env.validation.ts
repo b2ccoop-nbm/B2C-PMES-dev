@@ -50,6 +50,21 @@ export const envValidationSchema = Joi.object({
 
   /** B2C-Store service auth — GET /integrations/v1/members/resolve */
   STORE_INTEGRATION_SECRET: Joi.string().allow(""),
+
+  /**
+   * FEAT-004: Gmail API sender (b2ccoop@gmail.com). Off by default until Nilo grants OAuth.
+   * Tests must keep this unset / false and mock sendMembershipEmail.
+   */
+  GMAIL_SENDING_ENABLED: Joi.string().valid("true", "false", "1", "0", "yes", "no", "").default(""),
+  GMAIL_OAUTH_CLIENT_ID: Joi.string().allow(""),
+  GMAIL_OAUTH_CLIENT_SECRET: Joi.string().allow(""),
+  GMAIL_OAUTH_REFRESH_TOKEN: Joi.string().allow(""),
+  GMAIL_FROM: Joi.string().allow(""),
+  TURNSTILE_SECRET_KEY: Joi.string().allow(""),
+  MEMBERSHIP_CRON_SECRET: Joi.string().allow(""),
+  DPA_CONSENT_VERSION: Joi.string().allow(""),
+  PUBLIC_APP_URL: Joi.string().allow(""),
+  MEMBERSHIP_FIREBASE_MOCK: Joi.string().allow(""),
 })
   .custom((value, helpers) => {
     const v = value as {

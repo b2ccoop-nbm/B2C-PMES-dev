@@ -3,6 +3,7 @@ import { getSql } from "@/lib/db";
 import { assertMemberEmailMatchesFirebaseToken } from "@/lib/pmes-edge/member-bearer";
 import { normalizeEmail } from "@/lib/pmes-edge/norm";
 import { isMissingMemberProfileStampColumnError } from "@/lib/pmes-edge/pg-stamp-fallback";
+import { isValidTin, normalizeTinDigits } from "@/lib/membership/validators";
 
 type Body = {
   email?: string;
@@ -11,6 +12,7 @@ type Body = {
   dob?: string;
   gender?: string;
   mailingAddress?: string;
+  tinNo?: string;
 };
 
 export async function PATCH(request: Request) {
@@ -80,8 +82,16 @@ export async function PATCH(request: Request) {
     const t = String(body.mailingAddress).trim();
     data.mailingAddress = t ? t.slice(0, 4000) : null;
   }
+  let tinNo: string | null | undefined;
+  if (body.tinNo !== undefined) {
+    const digits = normalizeTinDigits(body.tinNo);
+    if (digits && !isValidTin(digits)) {
+      return NextResponse.json({ message: "TIN must be 9–12 digits.", statusCode: 400 }, { status: 400 });
+    }
+    tinNo = digits || null;
+  }
 
-  if (Object.keys(data).length === 0) {
+  if (Object.keys(data).length === 0 && tinNo === undefined) {
     return NextResponse.json({ message: "Provide at least one field to update.", statusCode: 400 }, { status: 400 });
   }
 
@@ -100,6 +110,40 @@ export async function PATCH(request: Request) {
   const dob = data.dob;
   const gender = data.gender;
   const mailingAddress = data.mailingAddress;
+
+  if (tinNo !== undefined) {
+    if (tinNo) {
+      const clash = await sql`
+        SELECT id FROM "Participant" WHERE "tinNo" = ${tinNo} AND email <> ${email} LIMIT 1
+      `;
+      if ((clash as { id: string }[]).length) {
+        return NextResponse.json(
+          { message: "This TIN is already on file. Contact the Secretary.", statusCode: 409 },
+          { status: 409 },
+        );
+      }
+    }
+    try {
+      await sql`
+        UPDATE "Participant"
+        SET
+          "tinNo" = ${tinNo},
+          "tinMissingFlaggedAt" = ${tinNo ? null : new Date()},
+          "memberProfileConcurrencyStamp" = "memberProfileConcurrencyStamp" + 1
+        WHERE id = ${row.id}::uuid
+      `;
+    } catch (e) {
+      if (!isMissingMemberProfileStampColumnError(e)) throw e;
+      await sql`
+        UPDATE "Participant"
+        SET "tinNo" = ${tinNo}, "tinMissingFlaggedAt" = ${tinNo ? null : new Date()}
+        WHERE id = ${row.id}::uuid
+      `;
+    }
+    if (Object.keys(data).length === 0) {
+      return NextResponse.json({ success: true as const });
+    }
+  }
 
   try {
     if (

@@ -896,6 +896,11 @@ export default function LandingPage({
             >
               {authUser ? (hidePmesEntry ? "Continue" : "PMES") : "Join us"}
             </button>
+            {!authUser ? (
+              <a href="/register" className="rounded-full border border-stone-300 px-4 py-2 text-xs font-bold uppercase tracking-wide text-stone-700 hover:border-blue-600 hover:text-blue-700">
+                Apply
+              </a>
+            ) : null}
           </div>
           <button
             type="button"

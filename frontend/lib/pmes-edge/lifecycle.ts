@@ -77,6 +77,8 @@ export function toLifecyclePayload(participant: ParticipantWithRels) {
     bodMajorityRequired: BOD_MAJORITY_APPROVALS,
     bodDirectorSeats: BOD_DIRECTOR_SEATS,
     boardResolutionNo: participant.boardResolutionNo ?? null,
+    needsTin: !String(participant.tinNo ?? "").trim(),
+    tinMissingFlaggedAt: participant.tinMissingFlaggedAt ?? null,
   };
 }
 
@@ -111,6 +113,8 @@ export function noParticipantLifecycle(email: string) {
     bodMajorityRequired: BOD_MAJORITY_APPROVALS,
     bodDirectorSeats: BOD_DIRECTOR_SEATS,
     boardResolutionNo: null as string | null,
+    needsTin: false,
+    tinMissingFlaggedAt: null as string | Date | null,
   };
 }
 

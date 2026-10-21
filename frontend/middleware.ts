@@ -9,7 +9,7 @@ import type { NextRequest } from "next/server";
 function withCors(response: NextResponse) {
   response.headers.set("Access-Control-Allow-Origin", "*");
   response.headers.set("Access-Control-Allow-Methods", "GET,POST,PATCH,DELETE,OPTIONS");
-  response.headers.set("Access-Control-Allow-Headers", "Content-Type, Authorization, x-member-sync-secret");
+  response.headers.set("Access-Control-Allow-Headers", "Content-Type, Authorization, x-member-sync-secret, X-Resume-Token, x-cron-secret");
   return response;
 }
 
@@ -24,6 +24,7 @@ export const config = {
   matcher: [
     "/api/:path*",
     "/pmes/:path*",
+    "/membership/:path*",
     "/health",
     "/auth/:path*",
     "/ai/:path*",

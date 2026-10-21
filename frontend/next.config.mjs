@@ -40,6 +40,13 @@ const nextConfig = {
       { source: "/pmes/member/resolve-login-email", destination: "/api/pmes/member/resolve-login-email" },
       { source: "/pmes/member/callsign", destination: "/api/pmes/member/callsign" },
       { source: "/pmes/pioneer/check-eligibility", destination: "/api/pmes/pioneer/check-eligibility" },
+      { source: "/membership/:path*", destination: "/api/membership/:path*" },
+      { source: "/pmes/admin/membership-applications", destination: "/api/pmes/admin/membership-applications" },
+      { source: "/pmes/admin/membership-applications/:path*", destination: "/api/pmes/admin/membership-applications/:path*" },
+      { source: "/pmes/admin/participant/secretary-confirm", destination: "/api/pmes/admin/participant/secretary-confirm" },
+      { source: "/pmes/admin/participant/bod-vote", destination: "/api/pmes/admin/participant/bod-vote" },
+      { source: "/pmes/admin/participant/membership-payment", destination: "/api/pmes/admin/participant/membership-payment" },
+      { source: "/pmes/member/basic-profile", destination: "/api/pmes/member/basic-profile" },
     ];
   },
 };

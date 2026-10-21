@@ -16,11 +16,14 @@ export function canCastBodVote(jwtRole, dbRole) {
  * Mirrors `toLifecyclePayload` stages in the API.
  */
 export function countMembershipInboxByStage(rows) {
-  const out = { treasurer: 0, bod: 0, secretary: 0 };
+  const out = { treasurer: 0, bod: 0, secretary: 0, onlinePayments: 0 };
   if (!Array.isArray(rows)) return out;
   for (const r of rows) {
     const st = String(r.stage || "");
-    if (st === "AWAITING_PAYMENT") out.treasurer += 1;
+    if (st === "AWAITING_PAYMENT") {
+      out.treasurer += 1;
+      out.onlinePayments += 1;
+    }
     else if (st === "AWAITING_BOD_VOTE") out.bod += 1;
     else if (st === "AWAITING_SECRETARY_RESOLUTION") out.secretary += 1;
   }
@@ -49,6 +52,11 @@ export function staffPipelineInboxSummary(role, counts, dbRole) {
     if (counts.treasurer > 0) {
       lines.push(
         `${counts.treasurer} member application${counts.treasurer === 1 ? "" : "s"} need fee confirmation (Treasurer).`,
+      );
+    }
+    if (counts.onlinePayments > 0) {
+      lines.push(
+        `${counts.onlinePayments} online application${counts.onlinePayments === 1 ? "" : "s"} are in the Treasurer payments-to-confirm queue.`,
       );
     }
   }

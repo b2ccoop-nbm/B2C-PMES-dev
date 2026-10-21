@@ -4,7 +4,7 @@ import { NextResponse } from "next/server";
 export const EDGE_CORS_HEADERS: Record<string, string> = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET,POST,PATCH,DELETE,OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type, Authorization, x-member-sync-secret",
+  "Access-Control-Allow-Headers": "Content-Type, Authorization, x-member-sync-secret, X-Resume-Token, x-cron-secret",
 };
 
 export function edgeCorsOptions(): NextResponse {

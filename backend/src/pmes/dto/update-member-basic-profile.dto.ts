@@ -30,4 +30,10 @@ export class UpdateMemberBasicProfileDto {
   @IsString()
   @MaxLength(4000)
   mailingAddress?: string;
+
+  /** 9–12 digits when present; clears tinMissingFlaggedAt. */
+  @IsOptional()
+  @IsString()
+  @MaxLength(32)
+  tinNo?: string;
 }

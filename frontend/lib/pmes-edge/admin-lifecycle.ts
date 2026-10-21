@@ -24,6 +24,8 @@ export type AdminLifecycleRow = {
   bodApproveVoteCount?: number | null;
   boardApprovedAt: string | null;
   fullProfileCompletedAt: string | null;
+  tinNo?: string | null;
+  tinMissingFlaggedAt?: string | Date | null;
 };
 
 function computeAlternatePublicHandle(input: {
@@ -92,5 +94,7 @@ export function toLifecyclePayload(row: AdminLifecycleRow) {
     bodMajorityRequired: BOD_MAJORITY_APPROVALS,
     bodDirectorSeats: BOD_DIRECTOR_SEATS,
     boardResolutionNo: row.boardResolutionNo,
+    needsTin: !String(row.tinNo ?? "").trim(),
+    tinMissingFlaggedAt: row.tinMissingFlaggedAt ?? null,
   };
 }
