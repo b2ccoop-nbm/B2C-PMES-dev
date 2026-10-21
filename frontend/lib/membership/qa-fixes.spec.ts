@@ -7,6 +7,8 @@ import { detectImageMime, generateUploadKey, validateScreenshotBytes } from "./s
 import { continueUrl, isResumeTokenExpired, resumeCookie } from "./tokens";
 import { turnstileCanSkip } from "./turnstile";
 import { isValidEmail } from "./validators";
+import { canAccessMembershipApplications, membershipScreenshotPath } from "./staff-access";
+import { toPublicApplication, type ApplicationRow } from "./edge-service";
 import { allowedCorsOrigins, isAllowedCorsOrigin } from "../edge-cors";
 
 describe("Worker QA D must-fixes", () => {
@@ -61,5 +63,52 @@ describe("Worker QA D must-fixes", () => {
   it("CORS is allowlisted", () => {
     expect(isAllowedCorsOrigin("https://evil.example")).toBe(false);
     expect(allowedCorsOrigins()).toContain("https://b2ccoop.com");
+  });
+
+  it("H7: public payloads omit possibleDuplicateOfId and raw screenshot keys", () => {
+    const row = {
+      id: "app-1",
+      status: "DRAFT",
+      resumeTokenHash: "hash",
+      participantId: null,
+      fullName: "A",
+      firstName: "A",
+      middleName: null,
+      lastName: "B",
+      dob: "1990-01-01",
+      gender: "female",
+      email: "a@test.com",
+      mobile: "+639171234567",
+      tinNo: "123456789",
+      residentialAddress: null,
+      referredByParticipantId: null,
+      shareCapitalAmount: 1000,
+      shareCapitalPaid: false,
+      membershipFeeAmount: 500,
+      membershipFeePaid: false,
+      paymentMode: null,
+      gcashRefNo: null,
+      gcashScreenshotKey: "membership/app-1/secret.webp",
+      paymentDeclaredAt: null,
+      possibleDuplicateOfId: "other-member",
+      submittedAt: null,
+      dpaConsentAt: new Date().toISOString(),
+      createdAt: new Date().toISOString(),
+    } as ApplicationRow;
+    const pub = toPublicApplication(row);
+    expect(pub).not.toHaveProperty("possibleDuplicateOfId");
+    expect(pub).not.toHaveProperty("gcashScreenshotKey");
+    expect(pub.hasGcashScreenshot).toBe(true);
+    expect(JSON.stringify(pub)).not.toContain("secret.webp");
+    expect(JSON.stringify(pub)).not.toContain("other-member");
+  });
+
+  it("H7: admin list is treasurer/secretary/superuser and screenshot URL is authorized", () => {
+    expect(canAccessMembershipApplications("treasurer")).toBe(true);
+    expect(canAccessMembershipApplications("secretary")).toBe(true);
+    expect(canAccessMembershipApplications("superuser")).toBe(true);
+    expect(canAccessMembershipApplications("admin")).toBe(false);
+    expect(canAccessMembershipApplications("board_director")).toBe(false);
+    expect(membershipScreenshotPath("app-9")).toBe("/pmes/admin/membership-applications/app-9/screenshot");
   });
 });

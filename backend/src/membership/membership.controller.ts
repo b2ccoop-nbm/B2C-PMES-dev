@@ -168,8 +168,14 @@ export class MembershipController {
 
   @Get("pmes/admin/membership-applications")
   @UseGuards(StaffJwtGuard)
-  adminList(@Query("status") status?: string, @Query("q") q?: string) {
-    return this.membership.adminList({ status, q });
+  adminList(@Req() req: StaffRequest, @Query("status") status?: string, @Query("q") q?: string) {
+    return this.membership.adminList(req.staffUser, { status, q });
+  }
+
+  @Get("pmes/admin/membership-applications/:id/screenshot")
+  @UseGuards(StaffJwtGuard)
+  adminScreenshot(@Param("id") id: string, @Req() req: StaffRequest) {
+    return this.membership.adminGetScreenshot(id, req.staffUser);
   }
 
   @Post("pmes/admin/membership-applications/:id/confirm-payment")

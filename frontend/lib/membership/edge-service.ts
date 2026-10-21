@@ -9,6 +9,7 @@ import {
 import { blockingFinding, evaluateDuplicates, firstFlaggedParticipantId, type DuplicateLookup } from "@/lib/membership/duplicate-engine";
 import { approvedEmail, rejectedEmail, resumeEmail, setPasswordEmail, treasurerPromptEmail } from "@/lib/membership/email-templates";
 import { publicCreateForExistingApplication } from "@/lib/membership/existing-draft-policy";
+import { membershipScreenshotPath } from "@/lib/membership/staff-access";
 import { createFirebaseMemberAccount, deleteFirebaseMemberAccount } from "@/lib/membership/firebase-signup";
 import { sendMembershipEmail } from "@/lib/membership/mailer";
 import { draftIpWindow, isRateLimited, lookupIpWindow, submitEmailWindow } from "@/lib/membership/rate-limit";
@@ -117,7 +118,6 @@ export function toPublicApplication(row: ApplicationRow) {
     paymentMode: row.paymentMode,
     gcashRefNo: row.gcashRefNo,
     hasGcashScreenshot: Boolean(row.gcashScreenshotKey),
-    possibleDuplicateOfId: row.possibleDuplicateOfId,
     submittedAt: row.submittedAt,
     participantId: row.participantId,
     dpaConsentAt: row.dpaConsentAt,
@@ -844,7 +844,8 @@ export async function adminListApplications(query: { status?: string; q?: string
       memberIdNo: r.memberIdNo,
       initialFeesPaidAt: r.initialFeesPaidAt,
       boardApprovedAt: r.boardApprovedAt,
-      gcashScreenshotKey: r.gcashScreenshotKey,
+      flaggedPossibleDuplicate: Boolean(r.possibleDuplicateOfId),
+      screenshotUrl: r.gcashScreenshotKey ? membershipScreenshotPath(r.id) : null,
     })),
     inbox: { paymentsToConfirm: Number((pending as { c: number }[])[0]?.c ?? 0) },
   };

@@ -33,6 +33,7 @@ import { allocateMemberPublicId, maskGivenName, referrerIsApproved } from "./mem
 import { draftIpWindow, isRateLimited, lookupIpWindow, submitEmailWindow } from "./rate-limit";
 import { derivedApplicationStatus, nextStatusAfterLifecycle } from "./status-sync";
 import { publicCreateForExistingApplication } from "./existing-draft-policy";
+import { canAccessMembershipApplications, membershipScreenshotPath } from "./staff-access";
 import { referrerConflictMessage } from "./referrer-rules";
 import { generateUploadKey, validateScreenshotBytes } from "./screenshot";
 import { generateResumeToken, hashResumeToken, isResumeTokenExpired, resumeTokenExpiresAt, tokensMatch, continueUrl } from "./tokens";
@@ -213,7 +214,6 @@ export class MembershipService {
       paymentMode: row.paymentMode,
       gcashRefNo: row.gcashRefNo,
       hasGcashScreenshot: Boolean(row.gcashScreenshotKey),
-      possibleDuplicateOfId: row.possibleDuplicateOfId,
       submittedAt: row.submittedAt,
       participantId: row.participantId,
       dpaConsentAt: row.dpaConsentAt,
@@ -736,6 +736,20 @@ export class MembershipService {
     return this.publicApplication(updated);
   }
 
+  async adminGetScreenshot(id: string, staff: { role: StaffJwtRole }) {
+    if (!canAccessMembershipApplications(staff.role)) {
+      throw new ForbiddenException("Only Treasurer, Secretary, or Superuser may view GCash screenshots.");
+    }
+    const row = await this.prisma.membershipApplication.findUnique({
+      where: { id },
+      select: { gcashScreenshotKey: true },
+    });
+    if (!row?.gcashScreenshotKey) {
+      throw new NotFoundException("No screenshot");
+    }
+    throw new NotFoundException("Screenshot not available");
+  }
+
   async expireDrafts(now = new Date()) {
     const cutoff = new Date(now.getTime() - DRAFT_TTL_DAYS * 24 * 60 * 60 * 1000);
     const expired = await this.prisma.membershipApplication.updateMany({
@@ -770,7 +784,10 @@ export class MembershipService {
     return { reminded: sent };
   }
 
-  async adminList(query: { status?: string; q?: string }) {
+  async adminList(staff: { role: StaffJwtRole }, query: { status?: string; q?: string }) {
+    if (!canAccessMembershipApplications(staff.role)) {
+      throw new ForbiddenException("Only Treasurer, Secretary, or Superuser may list online applications.");
+    }
     const where: Prisma.MembershipApplicationWhereInput = {};
     if (query.status) {
       where.status = query.status as MembershipApplicationStatus;
@@ -803,6 +820,8 @@ export class MembershipService {
         memberIdNo: r.participant?.memberIdNo ?? null,
         initialFeesPaidAt: r.participant?.initialFeesPaidAt ?? null,
         boardApprovedAt: r.participant?.boardApprovedAt ?? null,
+        flaggedPossibleDuplicate: Boolean(r.possibleDuplicateOfId),
+        screenshotUrl: r.gcashScreenshotKey ? membershipScreenshotPath(r.id) : null,
       })),
       inbox: { paymentsToConfirm: pendingPayment },
     };

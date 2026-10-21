@@ -1,4 +1,4 @@
-import { BadRequestException, ConflictException, UnauthorizedException } from "@nestjs/common";
+import { BadRequestException, ConflictException, ForbiddenException, NotFoundException, UnauthorizedException } from "@nestjs/common";
 import { MembershipApplicationStatus } from "@prisma/client";
 import { MembershipService } from "./membership.service";
 import { hashResumeToken } from "./tokens";
@@ -310,6 +310,47 @@ describe("MembershipService", () => {
     const confirmed = await service.adminConfirmPayment(row.id, { sub: "tr-1", role: "treasurer" }, { receiptNo: "OR-1" });
     expect(confirmed.application.status).toBe(MembershipApplicationStatus.PAYMENT_CONFIRMED);
     expect(accounting.postInitialFeesPaidAwait).toHaveBeenCalled();
+  });
+
+  it("omits possibleDuplicateOfId from public payloads", async () => {
+    const row = draftRow({ possibleDuplicateOfId: "other-member-id" });
+    const { service } = serviceFor(row);
+    const out = await service.getDraft(row.id, "resume-token-plain");
+    expect(out).not.toHaveProperty("possibleDuplicateOfId");
+    expect(out).not.toHaveProperty("gcashScreenshotKey");
+  });
+
+  it("restricts the admin list and never returns a raw screenshot key", async () => {
+    const row = draftRow({
+      possibleDuplicateOfId: "other-id",
+      gcashScreenshotKey: "membership/app-1/secret.webp",
+    });
+    const { service, prisma } = serviceFor(row);
+    prisma.membershipApplication.findMany.mockResolvedValue([{ ...row, participant: { memberIdNo: "B2C-XX-90-AAAA" } }]);
+    await expect(service.adminList({ role: "board_director" }, {})).rejects.toBeInstanceOf(ForbiddenException);
+    await expect(service.adminList({ role: "admin" }, {})).rejects.toBeInstanceOf(ForbiddenException);
+    const list = await service.adminList({ role: "treasurer" }, {});
+    const app = list.applications[0];
+    expect(app).not.toHaveProperty("gcashScreenshotKey");
+    expect(app).not.toHaveProperty("possibleDuplicateOfId");
+    expect(app.flaggedPossibleDuplicate).toBe(true);
+    expect(app.screenshotUrl).toBe("/pmes/admin/membership-applications/app-1/screenshot");
+    expect(JSON.stringify(app)).not.toContain("secret.webp");
+  });
+
+  it("serves screenshots only to treasurer/secretary/superuser and never leaks the key", async () => {
+    const row = draftRow({ gcashScreenshotKey: "membership/app-1/secret.webp" });
+    const { service, prisma } = serviceFor(row);
+    prisma.membershipApplication.findUnique.mockResolvedValue({ gcashScreenshotKey: "membership/app-1/secret.webp" });
+    await expect(service.adminGetScreenshot(row.id, { role: "board_director" })).rejects.toBeInstanceOf(ForbiddenException);
+    try {
+      await service.adminGetScreenshot(row.id, { role: "treasurer" });
+      throw new Error("expected not found");
+    } catch (e) {
+      expect(e).toBeInstanceOf(NotFoundException);
+      expect(String((e as Error).message)).toBe("Screenshot not available");
+      expect(JSON.stringify(e)).not.toContain("secret.webp");
+    }
   });
 });
 

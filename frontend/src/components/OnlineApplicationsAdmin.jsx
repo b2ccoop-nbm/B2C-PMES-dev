@@ -1,5 +1,7 @@
 import { useEffect, useState } from "react";
 
+const LIST_ROLES = ["treasurer", "secretary", "superuser"];
+
 export function OnlineApplicationsAdmin({ staffAccessToken, staffRole, apiBase, onRefreshPipeline }) {
   const [rows, setRows] = useState([]);
   const [inbox, setInbox] = useState(0);
@@ -28,7 +30,7 @@ export function OnlineApplicationsAdmin({ staffAccessToken, staffRole, apiBase, 
     void load().catch((e) => setError(e instanceof Error ? e.message : "Load failed"));
   }, [staffAccessToken, status]);
 
-  if (!staffAccessToken) return null;
+  if (!staffAccessToken || !LIST_ROLES.includes(staffRole)) return null;
 
   return (
     <section className="border-b border-slate-200 px-6 py-8 lg:px-10">
@@ -84,17 +86,25 @@ export function OnlineApplicationsAdmin({ staffAccessToken, staffRole, apiBase, 
           <p>Member ID: {detail.memberIdNo || "—"} · Status: {detail.status}</p>
           <p>Declared paid: share {detail.shareCapitalPaid ? "yes" : "no"} · fee {detail.membershipFeePaid ? "yes" : "no"}</p>
           <p>Mode: {detail.paymentMode || "—"} · GCash: {detail.gcashRefNo || "—"}</p>
-          {detail.hasGcashScreenshot ? (
-            <a
+          {detail.hasGcashScreenshot || detail.screenshotUrl ? (
+            <button
+              type="button"
               className="mt-2 inline-block font-bold text-[#004aad]"
-              href={`${apiBase}/pmes/admin/membership-applications/${detail.id}/screenshot`}
-              target="_blank"
-              rel="noreferrer"
+              onClick={async () => {
+                const path = detail.screenshotUrl || `/pmes/admin/membership-applications/${detail.id}/screenshot`;
+                const res = await fetch(`${apiBase}${path}`, {
+                  headers: { Authorization: `Bearer ${staffAccessToken}` },
+                });
+                if (!res.ok) throw new Error("Screenshot not available");
+                const blob = await res.blob();
+                const url = URL.createObjectURL(blob);
+                window.open(url, "_blank", "noopener,noreferrer");
+              }}
             >
               View GCash screenshot
-            </a>
+            </button>
           ) : null}
-          {detail.possibleDuplicateOfId ? <p className="mt-2 font-bold text-amber-800">Possible duplicate of {detail.possibleDuplicateOfId}</p> : null}
+          {detail.flaggedPossibleDuplicate ? <p className="mt-2 font-bold text-amber-800">Possible duplicate flagged for staff review</p> : null}
           {["treasurer", "admin", "superuser"].includes(staffRole) ? (
             <div className="mt-4 flex flex-wrap gap-2">
               <input className="input-field" placeholder="Receipt no." value={receiptNo} onChange={(e) => setReceiptNo(e.target.value)} />

@@ -1,7 +1,8 @@
 import { getSql } from "@/lib/db";
 import { EDGE_CORS_HEADERS, edgeCorsOptions } from "@/lib/edge-cors";
 import { readGcashScreenshot } from "@/lib/membership/screenshot";
-import { requireStaff, unauthorized } from "@/lib/staff-edge-auth";
+import { canAccessMembershipApplications } from "@/lib/membership/staff-access";
+import { forbidden, requireStaff, unauthorized } from "@/lib/staff-edge-auth";
 import { NextResponse } from "next/server";
 
 export function OPTIONS() {
@@ -11,8 +12,8 @@ export function OPTIONS() {
 export async function GET(request: Request, ctx: { params: Promise<{ id: string }> }) {
   try {
     const staff = await requireStaff(request);
-    if (!["superuser", "admin", "treasurer"].includes(staff.role)) {
-      return NextResponse.json({ message: "Forbidden", statusCode: 403 }, { status: 403, headers: EDGE_CORS_HEADERS });
+    if (!canAccessMembershipApplications(staff.role)) {
+      return forbidden("Only Treasurer, Secretary, or Superuser may view GCash screenshots.", EDGE_CORS_HEADERS);
     }
     const { id } = await ctx.params;
     const sql = getSql();
