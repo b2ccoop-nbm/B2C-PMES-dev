@@ -1,13 +1,20 @@
 {
 	"$schema": "node_modules/wrangler/config-schema.json",
-	"main": ".open-next/worker.js",
+	"main": "custom-worker.js",
 	"name": "b2ccoop-webapp",
 	// Public Firebase project id (same as VITE_FIREBASE_PROJECT_ID on Pages); avoids losing it on deploy.
 	"vars": {
 		"FIREBASE_PROJECT_ID": "b2ccoop-87114",
 		"LANDING_CHAT_PROVIDER": "gemini",
-		"AI_PROVIDER": "noop"
+		"AI_PROVIDER": "noop",
+		"PUBLIC_APP_URL": "https://b2ccoop.com",
+		"MEMBERSHIP_CORS_ORIGINS": "https://b2ccoop.com,https://www.b2ccoop.com,https://b2ccoop-webapp-ui.pages.dev",
+		"NEXT_PUBLIC_TURNSTILE_SITE_KEY": "0x4AAAAAAFe-y53W4vWjMn_W"
 	},
+	"r2_buckets": [
+		{ "binding": "MEMBERSHIP_UPLOADS", "bucket_name": "b2ccoop-membership-uploads" }
+	],
+	"triggers": { "crons": ["0 16 * * *"] },
 	"compatibility_date": "2026-04-13",
 	"compatibility_flags": [
 		"nodejs_compat",

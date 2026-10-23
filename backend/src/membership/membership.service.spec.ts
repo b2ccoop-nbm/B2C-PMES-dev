@@ -288,25 +288,30 @@ describe("MembershipService", () => {
     ).rejects.toBeInstanceOf(BadRequestException);
   });
 
-  it("creates Firebase after the participant write and compensates on link failure", async () => {
+  it("does not persist a participant or SUBMITTED when Firebase signUp fails", async () => {
+    const row = draftRow();
+    const { service, prisma, firebase } = serviceFor(row);
+    firebase.signUp.mockRejectedValue(new Error("Auth down"));
+    await expect(service.submit(row.id, "resume-token-plain", { ip: "1.1.1.1" })).rejects.toThrow(/Auth down/);
+    expect(prisma.$transaction).not.toHaveBeenCalled();
+    expect(prisma.participant.create).not.toHaveBeenCalled();
+    expect(prisma.membershipApplication.update).not.toHaveBeenCalled();
+  });
+
+  it("creates Firebase before the participant write and compensates when persist fails", async () => {
     const row = draftRow();
     const { service, prisma, firebase } = serviceFor(row);
     const order: string[] = [];
-    prisma.$transaction.mockImplementation(async (fn: (tx: unknown) => Promise<unknown>) => {
-      order.push("db");
-      return fn(prisma);
-    });
     firebase.signUp.mockImplementation(async () => {
       order.push("firebase");
       return { localId: "fb-uid-1", email: row.email };
     });
-    prisma.participant.update.mockImplementation(async () => {
-      order.push("link");
-      throw new Error("link failed");
+    prisma.$transaction.mockImplementation(async () => {
+      order.push("db");
+      throw new Error("db failed");
     });
-    await expect(service.submit(row.id, "resume-token-plain", { ip: "1.1.1.1" })).rejects.toThrow(/link failed/);
-    expect(order[0]).toBe("db");
-    expect(order).toContain("firebase");
+    await expect(service.submit(row.id, "resume-token-plain", { ip: "1.1.1.1" })).rejects.toThrow(/db failed/);
+    expect(order).toEqual(["firebase", "db"]);
     expect(firebase.deleteUser).toHaveBeenCalledWith("fb-uid-1");
   });
 

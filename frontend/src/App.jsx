@@ -403,18 +403,6 @@ export default function App() {
     }
   }, []);
 
-  useEffect(() => {
-    if (!user?.email) {
-      setTinDismissedThisView(false);
-      setTinPromptOpen(false);
-      return;
-    }
-    if (membershipLifecycle?.needsTin === true && !tinDismissedThisView) {
-      setTinPromptOpen(true);
-    } else if (membershipLifecycle?.needsTin !== true) {
-      setTinPromptOpen(false);
-    }
-  }, [membershipLifecycle?.needsTin, user?.email, tinDismissedThisView]);
 
   const [signUp, setSignUp] = useState({
     firstName: "",
@@ -574,6 +562,19 @@ export default function App() {
   /** PostgreSQL membership pipeline when `VITE_API_BASE_URL` is set */
   const [membershipLifecycle, setMembershipLifecycle] = useState(/** @type {Record<string, unknown> | null} */ (null));
   const [membershipLoading, setMembershipLoading] = useState(false);
+
+  useEffect(() => {
+    if (!user?.email) {
+      setTinDismissedThisView(false);
+      setTinPromptOpen(false);
+      return;
+    }
+    if (membershipLifecycle?.needsTin === true && !tinDismissedThisView) {
+      setTinPromptOpen(true);
+    } else if (membershipLifecycle?.needsTin !== true) {
+      setTinPromptOpen(false);
+    }
+  }, [membershipLifecycle?.needsTin, user?.email, tinDismissedThisView]);
   /** Snapshot for the post–full-profile confirmation screen (Member ID, email). */
   const [memberSubmissionAck, setMemberSubmissionAck] = useState(
     /** @type {null | { memberIdNo: string; memberIdIsProvisional: boolean; loginEmail: string; officialContactEmail: string; displayName: string; alternatePublicHandle: string; callsign: string }} */ (

@@ -288,6 +288,43 @@ async function notifyTreasurers(sql: Sql, row: ApplicationRow) {
   await sql`UPDATE "MembershipApplication" SET "treasurerNotifiedAt" = NOW(), "updatedAt" = NOW() WHERE id = ${row.id}`;
 }
 
+/** Undo participant / SUBMITTED / new Auth user so a failed submit stays a resumable DRAFT. */
+export async function compensateFailedSubmit(
+  sql: Sql,
+  opts: {
+    applicationId: string;
+    createdParticipant: boolean;
+    participantId: string;
+    clearFirebaseUid: boolean;
+    firebase?: { uid: string; created: boolean };
+  },
+) {
+  try {
+    await sql`
+      UPDATE "MembershipApplication"
+      SET status = 'DRAFT',
+          "participantId" = NULL,
+          "submittedAt" = NULL,
+          "updatedAt" = NOW()
+      WHERE id = ${opts.applicationId}
+    `;
+  } catch {
+    /* still try participant + Auth cleanup */
+  }
+  try {
+    if (opts.createdParticipant) {
+      await sql`DELETE FROM "Participant" WHERE id = ${opts.participantId}`;
+    } else if (opts.clearFirebaseUid) {
+      await sql`UPDATE "Participant" SET "firebaseUid" = NULL WHERE id = ${opts.participantId}`;
+    }
+  } catch {
+    /* Auth cleanup still runs */
+  }
+  if (opts.firebase?.created) {
+    await deleteFirebaseMemberAccount(opts.firebase.uid).catch(() => undefined);
+  }
+}
+
 export async function createDraft(input: {
   email: string;
   mobile?: string;
@@ -521,7 +558,11 @@ export async function submitDraft(id: string, token: string, input: { captchaTok
   );
   const block = blockingFinding(dups);
   if (block) {
-    return jsonError(block.message, 409, { code: block.action === "reclaim" ? "LEGACY_RECLAIM" : "DUPLICATE", kind: block.kind });
+    const ownLinked =
+      block.kind === "email" && Boolean(row.participantId) && block.participantId === row.participantId;
+    if (!ownLinked) {
+      return jsonError(block.message, 409, { code: block.action === "reclaim" ? "LEGACY_RECLAIM" : "DUPLICATE", kind: block.kind });
+    }
   }
 
   const dob = parseIsoDateOnly(row.dob);
@@ -532,10 +573,32 @@ export async function submitDraft(id: string, token: string, input: { captchaTok
   const tin = row.tinNo ? normalizeTinDigits(row.tinNo) : null;
   const mailing = formatMailingAddress(row.residentialAddress as never);
 
+  // Firebase first: a failed Auth create must not consume a member ID or leave SUBMITTED.
+  let firebase;
+  try {
+    firebase = await createFirebaseMemberAccount(row.email, fullName);
+  } catch (e) {
+    return jsonError(e instanceof Error ? e.message : "Firebase account creation failed", 400);
+  }
+
   const existing = await sql`SELECT id, "memberIdNo", "referredByParticipantId", "registrationSource", "firebaseUid" FROM "Participant" WHERE email = ${row.email} LIMIT 1`;
   const existingRow = (existing as { id: string; memberIdNo: string | null; referredByParticipantId: string | null; registrationSource: string | null; firebaseUid: string | null }[])[0];
   const participantId = existingRow?.id ?? crypto.randomUUID();
+  const createdParticipant = !existingRow;
   const tinFlag = tin ? null : new Date();
+
+  if (existingRow?.firebaseUid && existingRow.firebaseUid !== firebase.uid) {
+    if (firebase.created) await deleteFirebaseMemberAccount(firebase.uid).catch(() => undefined);
+    return jsonError("Already registered — sign in or reset password", 409);
+  }
+
+  const otherUid = await sql`
+    SELECT id FROM "Participant" WHERE "firebaseUid" = ${firebase.uid} AND id <> ${participantId} LIMIT 1
+  `;
+  if ((otherUid as { id: string }[]).length) {
+    if (firebase.created) await deleteFirebaseMemberAccount(firebase.uid).catch(() => undefined);
+    return jsonError("Already registered — sign in or reset password", 409);
+  }
 
   let memberIdNo = existingRow?.memberIdNo ?? "";
   const writeParticipant = async (allocated: string) => {
@@ -552,85 +615,72 @@ export async function submitDraft(id: string, token: string, input: { captchaTok
           "memberIdNo" = ${memberIdNo},
           "referredByParticipantId" = COALESCE("referredByParticipantId", ${row.referredByParticipantId}),
           "tinMissingFlaggedAt" = ${tinFlag},
-          "registrationSource" = COALESCE("registrationSource", 'online_form')
+          "registrationSource" = COALESCE("registrationSource", 'online_form'),
+          "firebaseUid" = ${firebase.uid}
         WHERE id = ${existingRow.id}
       `;
     } else {
       await sql`
         INSERT INTO "Participant" (
           id, "fullName", email, phone, dob, gender, "tinNo", "mailingAddress",
-          "memberIdNo", "referredByParticipantId", "tinMissingFlaggedAt", "registrationSource"
+          "memberIdNo", "referredByParticipantId", "tinMissingFlaggedAt", "registrationSource", "firebaseUid"
         ) VALUES (
           ${participantId}, ${fullName}, ${row.email}, ${mobile}, ${dobIso}, ${String(row.gender ?? "").trim()},
           ${tin}, ${mailing || null}, ${memberIdNo}, ${row.referredByParticipantId},
-          ${tinFlag}, 'online_form'
+          ${tinFlag}, 'online_form', ${firebase.uid}
         )
       `;
     }
   };
+
   try {
     if (existingRow?.memberIdNo) {
       await writeParticipant(existingRow.memberIdNo);
     } else {
       await allocateMemberIdWithRetry(sql, fullName, row.firstName, row.lastName, dobIso, writeParticipant);
     }
+
+    const newToken = await generateResumeToken();
+    const newHash = await hashResumeToken(newToken);
+    const newExp = resumeTokenExpiresAt();
+    const updated = await sql`
+      UPDATE "MembershipApplication" SET
+        status = 'SUBMITTED',
+        "participantId" = ${participantId},
+        "fullName" = ${fullName},
+        "submittedAt" = NOW(),
+        "resumeTokenHash" = ${newHash},
+        "resumeTokenExpiresAt" = ${newExp},
+        "possibleDuplicateOfId" = ${firstFlaggedParticipantId(dups)},
+        "updatedAt" = NOW()
+      WHERE id = ${row.id}
+      RETURNING *
+    `;
+    const next = (updated as ApplicationRow[])[0]!;
+
+    await notifyTreasurers(sql, next);
+    return {
+      ok: true as const,
+      status: 200,
+      body: {
+        application: toPublicApplication(next),
+        resumeToken: newToken,
+        memberIdNo,
+        participantId,
+        needsTin: !tin,
+        passwordEmailSent: firebase.passwordEmailSent,
+      },
+    };
   } catch (e) {
+    await compensateFailedSubmit(sql, {
+      applicationId: row.id,
+      createdParticipant,
+      participantId,
+      clearFirebaseUid: Boolean(existingRow && !existingRow.firebaseUid),
+      firebase,
+    });
     return jsonError(e instanceof Error ? e.message : "Could not create participant", 400);
   }
-
-  const newToken = await generateResumeToken();
-  const newHash = await hashResumeToken(newToken);
-  const newExp = resumeTokenExpiresAt();
-  const updated = await sql`
-    UPDATE "MembershipApplication" SET
-      status = 'SUBMITTED',
-      "participantId" = ${existingRow?.id ?? participantId},
-      "fullName" = ${fullName},
-      "submittedAt" = NOW(),
-      "resumeTokenHash" = ${newHash},
-      "resumeTokenExpiresAt" = ${newExp},
-      "possibleDuplicateOfId" = ${firstFlaggedParticipantId(dups)},
-      "updatedAt" = NOW()
-    WHERE id = ${row.id}
-    RETURNING *
-  `;
-  const next = (updated as ApplicationRow[])[0]!;
-
-  let firebase;
-  try {
-    firebase = await createFirebaseMemberAccount(row.email, fullName);
-  } catch (e) {
-    return jsonError(e instanceof Error ? e.message : "Firebase account creation failed", 400);
-  }
-
-  const otherUid = await sql`
-    SELECT id FROM "Participant" WHERE "firebaseUid" = ${firebase.uid} AND id <> ${existingRow?.id ?? participantId} LIMIT 1
-  `;
-  if ((otherUid as { id: string }[]).length) {
-    if (firebase.created) await deleteFirebaseMemberAccount(firebase.uid).catch(() => undefined);
-    return jsonError("Already registered — sign in or reset password", 409);
-  }
-
-  try {
-    await sql`UPDATE "Participant" SET "firebaseUid" = ${firebase.uid} WHERE id = ${existingRow?.id ?? participantId}`;
-  } catch (e) {
-    if (firebase.created) await deleteFirebaseMemberAccount(firebase.uid).catch(() => undefined);
-    return jsonError(e instanceof Error ? e.message : "Could not link Firebase login", 400);
-  }
-
-  await notifyTreasurers(sql, next);
-  return {
-    ok: true as const,
-    status: 200,
-    body: {
-      application: toPublicApplication(next),
-      resumeToken: newToken,
-      memberIdNo,
-      participantId: existingRow?.id ?? participantId,
-      needsTin: !tin,
-      passwordEmailSent: firebase.passwordEmailSent,
-    },
-  };
 }
 
 export async function resendResume(id: string, token: string) {
