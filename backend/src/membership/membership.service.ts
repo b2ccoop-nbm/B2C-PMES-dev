@@ -107,6 +107,13 @@ export class MembershipService {
     if (!v.ok) throw new BadRequestException(v.message ?? "Captcha verification failed.");
   }
 
+  private async compensateCreatedFirebaseUser(created: boolean | undefined, uid: string | undefined) {
+    if (!created || !uid) return;
+    await this.firebase?.deleteUser?.(uid).catch((e) =>
+      this.logger.warn(`Firebase compensate delete skipped: ${e instanceof Error ? e.message : e}`),
+    );
+  }
+
   private async duplicateLookup(): Promise<DuplicateLookup> {
     return {
       findParticipantByEmail: async (email) => this.toLite(await this.prisma.participant.findUnique({ where: { email } })),
@@ -465,10 +472,14 @@ export class MembershipService {
     }
     const block = blockingFinding(dups);
     if (block) {
-      if (block.action === "reclaim") {
-        throw new ConflictException({ message: block.message, code: "LEGACY_RECLAIM", participantId: block.participantId });
+      const ownLinked =
+        block.kind === "email" && Boolean(row.participantId) && block.participantId === row.participantId;
+      if (!ownLinked) {
+        if (block.action === "reclaim") {
+          throw new ConflictException({ message: block.message, code: "LEGACY_RECLAIM", participantId: block.participantId });
+        }
+        throw new ConflictException({ message: block.message, code: "DUPLICATE", kind: block.kind });
       }
-      throw new ConflictException({ message: block.message, code: "DUPLICATE", kind: block.kind });
     }
 
     const dob = parseIsoDateOnly(row.dob)!;
@@ -481,118 +492,111 @@ export class MembershipService {
       throw new BadRequestException("Firebase Admin is not configured; cannot create a login on submit.");
     }
 
+    // Firebase first: a failed Auth create must not consume a member ID or leave SUBMITTED.
+    let firebaseAccount: { uid: string; created: boolean; passwordEmailSent: boolean };
+    try {
+      firebaseAccount = await createFirebaseMemberAccount(row.email, fullName, this.firebase);
+    } catch (e) {
+      if (e instanceof BadRequestException || e instanceof ConflictException) throw e;
+      throw new BadRequestException(e instanceof Error ? e.message : "Firebase account creation failed");
+    }
+
     const existingParticipant = await this.prisma.participant.findUnique({ where: { email: row.email } });
+    if (existingParticipant?.firebaseUid && existingParticipant.firebaseUid !== firebaseAccount.uid) {
+      await this.compensateCreatedFirebaseUser(firebaseAccount.created, firebaseAccount.uid);
+      throw new ConflictException("Already registered — sign in or reset password");
+    }
+    const otherUid = await this.prisma.participant.findFirst({
+      where: {
+        firebaseUid: firebaseAccount.uid,
+        ...(existingParticipant ? { NOT: { id: existingParticipant.id } } : {}),
+      },
+    });
+    if (otherUid) {
+      await this.compensateCreatedFirebaseUser(firebaseAccount.created, firebaseAccount.uid);
+      throw new ConflictException("Already registered — sign in or reset password");
+    }
+
     const newToken = generateResumeToken();
     let result: { participant: { id: string; memberIdNo: string | null; firebaseUid: string | null }; application: typeof row } | null = null;
     let lastUniqueError: unknown;
-    for (let attempt = 0; attempt < 5; attempt++) {
-      const memberIdNo =
-        existingParticipant?.memberIdNo ||
-        (await allocateMemberPublicId({
-          fullName,
-          firstName: row.firstName,
-          lastName: row.lastName,
-          dob: dobIso,
-          exists: async (candidate) => {
-            const hit = await this.prisma.participant.findFirst({ where: { memberIdNo: candidate } });
-            return Boolean(hit);
-          },
-        }));
-      try {
-        result = await this.prisma.$transaction(async (tx) => {
-          const participant = existingParticipant
-            ? await tx.participant.update({
-                where: { id: existingParticipant.id },
-                data: {
-                  fullName,
-                  phone: mobile,
-                  dob: dobIso,
-                  gender: String(row.gender).trim(),
-                  tinNo: tin,
-                  mailingAddress: mailing || existingParticipant.mailingAddress,
-                  memberIdNo: existingParticipant.memberIdNo || memberIdNo,
-                  referredByParticipantId: existingParticipant.referredByParticipantId ?? row.referredByParticipantId,
-                  tinMissingFlaggedAt: tin ? null : new Date(),
-                  registrationSource: existingParticipant.registrationSource ?? "online_form",
-                },
-              })
-            : await tx.participant.create({
-                data: {
-                  fullName,
-                  email: row.email,
-                  phone: mobile,
-                  dob: dobIso,
-                  gender: String(row.gender).trim(),
-                  tinNo: tin,
-                  mailingAddress: mailing || null,
-                  memberIdNo,
-                  referredByParticipantId: row.referredByParticipantId,
-                  tinMissingFlaggedAt: tin ? null : new Date(),
-                  registrationSource: "online_form",
-                },
-              });
-
-          const application = await tx.membershipApplication.update({
-            where: { id: row.id },
-            data: {
-              status: MembershipApplicationStatus.SUBMITTED,
-              participantId: participant.id,
-              fullName,
-              submittedAt: new Date(),
-              resumeTokenHash: hashResumeToken(newToken),
-              resumeTokenExpiresAt: resumeTokenExpiresAt(),
-              possibleDuplicateOfId: firstFlaggedParticipantId(dups),
-              paymentDeclaredAt: row.shareCapitalPaid || row.membershipFeePaid ? row.paymentDeclaredAt ?? new Date() : row.paymentDeclaredAt,
+    try {
+      for (let attempt = 0; attempt < 5; attempt++) {
+        const memberIdNo =
+          existingParticipant?.memberIdNo ||
+          (await allocateMemberPublicId({
+            fullName,
+            firstName: row.firstName,
+            lastName: row.lastName,
+            dob: dobIso,
+            exists: async (candidate) => {
+              const hit = await this.prisma.participant.findFirst({ where: { memberIdNo: candidate } });
+              return Boolean(hit);
             },
-          });
-          return { participant, application };
-        });
-        break;
-      } catch (e) {
-        lastUniqueError = e;
-        if (!isUniqueViolation(e) || existingParticipant?.memberIdNo) throw e;
-      }
-    }
-    if (!result) {
-      throw lastUniqueError instanceof Error ? lastUniqueError : new Error("Could not allocate a unique member ID.");
-    }
+          }));
+        try {
+          result = await this.prisma.$transaction(async (tx) => {
+            const participant = existingParticipant
+              ? await tx.participant.update({
+                  where: { id: existingParticipant.id },
+                  data: {
+                    fullName,
+                    phone: mobile,
+                    dob: dobIso,
+                    gender: String(row.gender).trim(),
+                    tinNo: tin,
+                    mailingAddress: mailing || existingParticipant.mailingAddress,
+                    memberIdNo: existingParticipant.memberIdNo || memberIdNo,
+                    referredByParticipantId: existingParticipant.referredByParticipantId ?? row.referredByParticipantId,
+                    tinMissingFlaggedAt: tin ? null : new Date(),
+                    registrationSource: existingParticipant.registrationSource ?? "online_form",
+                    firebaseUid: firebaseAccount.uid,
+                  },
+                })
+              : await tx.participant.create({
+                  data: {
+                    fullName,
+                    email: row.email,
+                    phone: mobile,
+                    dob: dobIso,
+                    gender: String(row.gender).trim(),
+                    tinNo: tin,
+                    mailingAddress: mailing || null,
+                    memberIdNo,
+                    referredByParticipantId: row.referredByParticipantId,
+                    tinMissingFlaggedAt: tin ? null : new Date(),
+                    registrationSource: "online_form",
+                    firebaseUid: firebaseAccount.uid,
+                  },
+                });
 
-    let passwordEmailSent = false;
-    let firebaseUid = result.participant.firebaseUid ?? existingParticipant?.firebaseUid ?? null;
-    if (firebaseUid) {
-      const created = await createFirebaseMemberAccount(row.email, fullName, this.firebase);
-      if (created.uid !== firebaseUid) {
-        throw new ConflictException("Already registered — sign in or reset password");
-      }
-      passwordEmailSent = created.passwordEmailSent;
-    } else {
-      const created = await createFirebaseMemberAccount(row.email, fullName, this.firebase);
-      const other = await this.prisma.participant.findFirst({
-        where: { firebaseUid: created.uid, NOT: { id: result.participant.id } },
-      });
-      if (other) {
-        if (created.created) {
-          await this.firebase.deleteUser?.(created.uid).catch((e) =>
-            this.logger.warn(`Firebase compensate delete skipped: ${e instanceof Error ? e.message : e}`),
-          );
+            const application = await tx.membershipApplication.update({
+              where: { id: row.id },
+              data: {
+                status: MembershipApplicationStatus.SUBMITTED,
+                participantId: participant.id,
+                fullName,
+                submittedAt: new Date(),
+                resumeTokenHash: hashResumeToken(newToken),
+                resumeTokenExpiresAt: resumeTokenExpiresAt(),
+                possibleDuplicateOfId: firstFlaggedParticipantId(dups),
+                paymentDeclaredAt: row.shareCapitalPaid || row.membershipFeePaid ? row.paymentDeclaredAt ?? new Date() : row.paymentDeclaredAt,
+              },
+            });
+            return { participant, application };
+          });
+          break;
+        } catch (e) {
+          lastUniqueError = e;
+          if (!isUniqueViolation(e) || existingParticipant?.memberIdNo) throw e;
         }
-        throw new ConflictException("Already registered — sign in or reset password");
       }
-      try {
-        await this.prisma.participant.update({
-          where: { id: result.participant.id },
-          data: { firebaseUid: created.uid },
-        });
-        firebaseUid = created.uid;
-        passwordEmailSent = created.passwordEmailSent;
-      } catch (e) {
-        if (created.created) {
-          await this.firebase.deleteUser?.(created.uid).catch((err) =>
-            this.logger.warn(`Firebase compensate delete skipped: ${err instanceof Error ? err.message : err}`),
-          );
-        }
-        throw e;
+      if (!result) {
+        throw lastUniqueError instanceof Error ? lastUniqueError : new Error("Could not allocate a unique member ID.");
       }
+    } catch (e) {
+      await this.compensateCreatedFirebaseUser(firebaseAccount.created, firebaseAccount.uid);
+      throw e;
     }
 
     await this.notifyTreasurers(result.application);
@@ -603,7 +607,7 @@ export class MembershipService {
       memberIdNo: result.participant.memberIdNo,
       participantId: result.participant.id,
       needsTin: !tin,
-      passwordEmailSent,
+      passwordEmailSent: firebaseAccount.passwordEmailSent,
     };
   }
 

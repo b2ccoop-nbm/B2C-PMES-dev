@@ -159,7 +159,7 @@ export async function identityToolkitSignUp(
   password: string,
   displayName: string,
 ): Promise<{ localId: string; email?: string }> {
-  const out = await identityToolkitPost(projectToolkitPath(projectId, "accounts:signUp"), {
+  const out = await identityToolkitPost(projectToolkitPath(projectId, "accounts"), {
     email: normalizeEmail(email),
     password,
     displayName,

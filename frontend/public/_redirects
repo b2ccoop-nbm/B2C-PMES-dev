@@ -1,3 +1,0 @@
-/register /index.html 200
-/register/* /index.html 200
-/set-password /index.html 200
