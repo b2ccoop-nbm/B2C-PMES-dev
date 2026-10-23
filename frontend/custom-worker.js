@@ -7,13 +7,15 @@
 import { default as handler } from "./.open-next/worker.js";
 import { runMembershipScheduled } from "./lib/membership/scheduled-handler.js";
 
-export default {
+const worker = {
   fetch: handler.fetch,
 
   async scheduled(controller, env, ctx) {
     await runMembershipScheduled(handler, controller, env, ctx);
   },
 };
+
+export default worker;
 
 // Re-export the Durable Object classes OpenNext emits so bindings keep working.
 // @ts-ignore generated at build time
